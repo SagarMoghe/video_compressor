@@ -16,6 +16,7 @@ import queue
 import shutil
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -24,12 +25,12 @@ from compress_video import (
     _gui_resume,
     _parse_bitrate_to_kbps,
     estimate_compressed_size,
+    format_size,
     probe_video,
 )
 from scan_and_compress import (
     _process_one,
     find_large_videos,
-    format_size,
     write_log,
 )
 
@@ -92,7 +93,6 @@ def _find_ffmpeg_dir() -> str:
         r"C:\ffmpeg\bin",
         r"C:\Program Files\ffmpeg\bin",
         r"C:\Program Files (x86)\ffmpeg\bin",
-        r"C:/Users/sagar/Downloads/Compressed/ffmpeg-8.1-full_build/ffmpeg-8.1-full_build/bin",
         os.path.join(os.path.expanduser("~"), "ffmpeg", "bin"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "ffmpeg", "bin"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "Programs", "ffmpeg", "bin"),
@@ -122,6 +122,18 @@ COL_SAVE    = "Savings"
 COL_PCT     = "Save %"
 COLUMNS     = (COL_CHECK, COL_NAME, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
 
+# Pre-computed column indices for fast access in hot loops
+_IDX_CHECK   = COLUMNS.index(COL_CHECK)
+_IDX_NAME    = COLUMNS.index(COL_NAME)
+_IDX_ORIG    = COLUMNS.index(COL_ORIG)
+_IDX_BITRATE = COLUMNS.index(COL_BITRATE)
+_IDX_EST     = COLUMNS.index(COL_EST)
+_IDX_SAVE    = COLUMNS.index(COL_SAVE)
+_IDX_PCT     = COLUMNS.index(COL_PCT)
+
+# Unit multipliers for size-string parsing (used by _sort_key)
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -134,6 +146,15 @@ def _probe_and_estimate(video: dict, target_kbps: int) -> dict:
     eff_kbps  = min(orig_kbps, target_kbps) if orig_kbps else target_kbps
     video["_est_size"] = estimate_compressed_size(duration, eff_kbps) if duration else 0
     return video
+
+
+def _compute_row_strings(orig: int, est: int) -> tuple[str, str, str]:
+    """Return (est_str, save_str, pct_str) for a single video row."""
+    save = orig - est if est > 0 else 0
+    est_str  = format_size(est)  if est  > 0 else "N/A"
+    save_str = format_size(save) if save > 0 else "N/A"
+    pct_str  = f"{save / orig * 100:.0f}%" if orig > 0 and est > 0 else "N/A"
+    return est_str, save_str, pct_str
 
 
 # ── Stdout redirector ─────────────────────────────────────────────────────────
@@ -174,9 +195,11 @@ class CompressApp(tk.Tk):
         self._job_running = False
         self._paused = False
         self._bitrate_refresh_id = None
+        self._sort_reverse: dict[str, bool] = {}  # track sort direction per column
 
         self._config = _load_config()
         self._build_ui()
+        self._restore_config()
         self._poll_log()
 
         # Redirect stdout so all print() / progress-bar writes appear in the log
@@ -205,7 +228,6 @@ class CompressApp(tk.Tk):
         ttk.Label(top, text="Bitrate:").pack(side="left")
         self._bitrate_var = tk.StringVar(value=DEFAULT_BITRATE)
         ttk.Entry(top, textvariable=self._bitrate_var, width=7).pack(side="left", padx=4)
-        self._bitrate_refresh_id = None
         self._bitrate_var.trace_add("write", self._on_bitrate_changed)
 
         ttk.Button(top, text="Scan", command=self._start_scan).pack(side="left", padx=8)
@@ -227,9 +249,12 @@ class CompressApp(tk.Tk):
                 foreground="red",
             ).pack(side="left", padx=6)
 
+        # ── Paned window (table + log) ────────────────────────────────────────
+        paned = ttk.PanedWindow(self, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=6, pady=2)
+
         # ── Table ──────────────────────────────────────────────────────────────
-        tbl_frame = ttk.Frame(self)
-        tbl_frame.pack(fill="both", expand=True, padx=6, pady=2)
+        tbl_frame = ttk.Frame(paned)
 
         vsb = ttk.Scrollbar(tbl_frame, orient="vertical")
         hsb = ttk.Scrollbar(tbl_frame, orient="horizontal")
@@ -261,6 +286,8 @@ class CompressApp(tk.Tk):
         self._tree.pack(fill="both", expand=True)
         self._tree.bind("<Button-1>", self._on_row_click)
 
+        paned.add(tbl_frame, weight=3)
+
         # ── Bottom bar: select-all + compress button + status ─────────────────
         bot = ttk.Frame(self)
         bot.pack(fill="x", padx=6, pady=4)
@@ -284,9 +311,16 @@ class CompressApp(tk.Tk):
             side="left", fill="x", expand=True, padx=8
         )
 
+        # ── Summary bar ────────────────────────────────────────────────────────
+        summary = ttk.Frame(self)
+        summary.pack(fill="x", padx=6, pady=(0, 2))
+
+        self._summary_var = tk.StringVar(value="")
+        ttk.Label(summary, textvariable=self._summary_var, anchor="w",
+                  font=("TkDefaultFont", 9, "bold")).pack(fill="x")
+
         # ── Log pane ───────────────────────────────────────────────────────────
-        log_frame = ttk.LabelFrame(self, text="Log")
-        log_frame.pack(fill="x", padx=6, pady=(0, 6))
+        log_frame = ttk.LabelFrame(paned, text="Log")
 
         self._log_text = tk.Text(log_frame, height=7, state="disabled", wrap="none")
         log_sb = ttk.Scrollbar(log_frame, command=self._log_text.yview)
@@ -294,18 +328,50 @@ class CompressApp(tk.Tk):
         log_sb.pack(side="right", fill="y")
         self._log_text.pack(fill="both", expand=True)
 
+        paned.add(log_frame, weight=1)
+
     # ── Browse ─────────────────────────────────────────────────────────────────
+
+    def _restore_config(self):
+        """Populate UI fields from the saved config."""
+        c = self._config
+        if c.get("recent_folders"):
+            self._folder_var.set(c["recent_folders"][0])
+        if c.get("ffmpeg_dir"):
+            self._ffmpeg_var.set(c["ffmpeg_dir"])
+            _inject_ffmpeg_path(c["ffmpeg_dir"])
+        if c.get("bitrate"):
+            self._bitrate_var.set(c["bitrate"])
+        if c.get("min_size_gb") is not None:
+            self._minsize_var.set(str(c["min_size_gb"]))
+
+    def _persist_config(self):
+        """Save current UI settings to the config file."""
+        folder = self._folder_var.get().strip()
+        if folder:
+            self._config = _add_recent_folder(self._config, folder)
+        ffmpeg_dir = self._ffmpeg_var.get().strip()
+        if ffmpeg_dir:
+            self._config["ffmpeg_dir"] = ffmpeg_dir
+        self._config["bitrate"] = self._bitrate_var.get().strip()
+        try:
+            self._config["min_size_gb"] = float(self._minsize_var.get())
+        except ValueError:
+            pass
+        _save_config(self._config)
 
     def _browse_folder(self):
         path = filedialog.askdirectory(title="Select folder to scan")
         if path:
             self._folder_var.set(path)
+            self._persist_config()
 
     def _browse_ffmpeg(self):
         path = filedialog.askdirectory(title="Select FFmpeg bin folder (containing ffmpeg.exe)")
         if path:
             self._ffmpeg_var.set(path)
             _inject_ffmpeg_path(path)
+            self._persist_config()
 
     def _ensure_ffmpeg(self) -> bool:
         """Inject ffmpeg dir into PATH and return True if ffmpeg is now accessible."""
@@ -338,26 +404,36 @@ class CompressApp(tk.Tk):
         self._set_status("Scanning…")
         self._compress_btn.state(["disabled"])
         self._clear_table()
+        self._persist_config()
         threading.Thread(target=self._scan_worker, args=(folder, min_gb), daemon=True).start()
 
     def _scan_worker(self, folder: str, min_gb: float):
         try:
-            min_bytes  = int(min_gb * (1 << 30))
+            min_bytes   = int(min_gb * (1 << 30))
             target_kbps = _parse_bitrate_to_kbps(self._bitrate_var.get())
             videos = find_large_videos(folder, min_bytes)
 
             size_filter = f" ≥ {min_gb} GB" if min_gb > 0 else ""
             self._log(f"Found {len(videos)} video(s){size_filter} in {folder}")
 
-            probed = []
-            for i, v in enumerate(videos, 1):
-                self._log(f"  Probing {i}/{len(videos)}: {os.path.basename(v['path'])}")
+            # Probe videos in parallel (ffprobe is I/O-bound)
+            probed = [None] * len(videos)
+            max_workers = min(4, len(videos)) or 1
+
+            def _probe_one(idx_video):
+                idx, v = idx_video
                 result = _probe_and_estimate(v, target_kbps)
                 probe  = result.get("_probe", {})
-                self._log(f"    duration={probe.get('duration')}s  "
+                self._log(f"  Probed {idx + 1}/{len(videos)}: "
+                          f"{os.path.basename(v['path'])}  "
+                          f"duration={probe.get('duration')}s  "
                           f"bitrate={probe.get('video_bitrate_kbps')}kbps  "
                           f"est={format_size(result.get('_est_size', 0))}")
-                probed.append(result)
+                return idx, result
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for idx, result in pool.map(_probe_one, enumerate(videos)):
+                    probed[idx] = result
 
             self.after(0, self._populate_table, probed)
         except Exception as exc:
@@ -371,27 +447,27 @@ class CompressApp(tk.Tk):
         self._clear_table()
         self._videos = videos  # must be set AFTER _clear_table resets it
 
-        for v in videos:
-            orig     = v["size"]
-            est      = v.get("_est_size", 0)
-            save     = orig - est if est > 0 else 0
-            pct      = f"{save / orig * 100:.0f}%" if orig > 0 and est > 0 else "N/A"
+        for idx, v in enumerate(videos):
+            orig      = v["size"]
+            est       = v.get("_est_size", 0)
             orig_kbps = v.get("_probe", {}).get("video_bitrate_kbps")
             bitrate_str = f"{orig_kbps} kbps" if orig_kbps else "N/A"
+            est_str, save_str, pct_str = _compute_row_strings(orig, est)
 
             var = tk.BooleanVar(value=True)
             self._check_vars.append(var)
 
             self._tree.insert(
                 "", "end",
+                iid=str(idx),
                 values=(
                     "☑",
                     os.path.basename(v["path"]),
                     format_size(orig),
                     bitrate_str,
-                    format_size(est) if est > 0 else "N/A",
-                    format_size(save) if save > 0 else "N/A",
-                    pct,
+                    est_str,
+                    save_str,
+                    pct_str,
                 ),
                 tags=("checked",),
             )
@@ -399,12 +475,12 @@ class CompressApp(tk.Tk):
         self._tree.tag_configure("checked",   background="#e8f5e9")
         self._tree.tag_configure("unchecked", background="#ffffff")
 
-        selected_count = sum(1 for v in self._check_vars if v.get())
+        self._compress_btn.state(["!disabled"])
+        selected = self._update_summary()
         self._set_status(
-            f"Found {len(videos)} file(s). {selected_count} selected. "
+            f"Found {len(videos)} file(s). {selected} selected. "
             "Uncheck any you don't want, then click Compress Selected."
         )
-        self._compress_btn.state(["!disabled"])
 
     def _on_bitrate_changed(self, *_):
         """Debounce bitrate edits — refresh estimates 400 ms after last keystroke."""
@@ -422,8 +498,9 @@ class CompressApp(tk.Tk):
             return  # invalid bitrate string — wait for user to finish typing
 
         children = self._tree.get_children()
-        for row_id, v in zip(children, self._videos):
-            probe    = v.get("_probe", {})
+        for row_id in children:
+            v = self._videos[int(row_id)]
+            probe     = v.get("_probe", {})
             orig_kbps = probe.get("video_bitrate_kbps")
             duration  = probe.get("duration")
 
@@ -431,15 +508,15 @@ class CompressApp(tk.Tk):
             est = estimate_compressed_size(duration, eff_kbps) if duration else 0
             v["_est_size"] = est
 
-            orig = v["size"]
-            save = orig - est if est > 0 else 0
-            pct  = f"{save / orig * 100:.0f}%" if orig > 0 and est > 0 else "N/A"
+            est_str, save_str, pct_str = _compute_row_strings(v["size"], est)
 
             vals = list(self._tree.item(row_id, "values"))
-            vals[COLUMNS.index(COL_EST)]  = format_size(est) if est > 0 else "N/A"
-            vals[COLUMNS.index(COL_SAVE)] = format_size(save) if save > 0 else "N/A"
-            vals[COLUMNS.index(COL_PCT)]  = pct
+            vals[_IDX_EST]  = est_str
+            vals[_IDX_SAVE] = save_str
+            vals[_IDX_PCT]  = pct_str
             self._tree.item(row_id, values=vals)
+
+        self._update_summary()
 
     def _clear_table(self):
         for item in self._tree.get_children():
@@ -447,14 +524,49 @@ class CompressApp(tk.Tk):
         self._check_vars = []
         self._videos = []
 
+    # ── Aggregate summary ────────────────────────────────────────────────────
+
+    def _update_summary(self):
+        """Recompute and display aggregate totals for selected files.
+        Also updates the status bar selection count. Returns the selected count."""
+        total = len(self._check_vars)
+        if not self._videos:
+            self._summary_var.set("")
+            return 0
+
+        total_orig = 0
+        total_est = 0
+        count = 0
+        for v, var in zip(self._videos, self._check_vars):
+            if var.get():
+                count += 1
+                total_orig += v["size"]
+                est = v.get("_est_size", 0)
+                total_est += est if est > 0 else v["size"]
+
+        self._set_status(f"{count} / {total} file(s) selected.")
+
+        if count == 0:
+            self._summary_var.set("No files selected.")
+            return 0
+
+        total_save = total_orig - total_est
+        pct = (total_save / total_orig * 100) if total_orig > 0 else 0
+        self._summary_var.set(
+            f"Selected: {count} file(s)  │  "
+            f"Original: {format_size(total_orig)}  │  "
+            f"Estimated: {format_size(total_est)}  │  "
+            f"Savings: {format_size(total_save)} ({pct:.1f}%)"
+        )
+        return count
+
     # ── Row click → toggle checkbox ────────────────────────────────────────────
 
     def _on_row_click(self, event):
         row_id = self._tree.identify_row(event.y)
         if not row_id:
             return
-        children = self._tree.get_children()
-        idx = list(children).index(row_id)
+        idx = int(row_id)
         if idx >= len(self._check_vars):
             return
 
@@ -466,8 +578,7 @@ class CompressApp(tk.Tk):
         vals[0] = "☑" if checked else "☐"
         self._tree.item(row_id, values=vals, tags=("checked" if checked else "unchecked",))
 
-        selected = sum(1 for v in self._check_vars if v.get())
-        self._set_status(f"{selected} / {len(self._check_vars)} file(s) selected.")
+        self._update_summary()
 
     # ── Select / Deselect All ──────────────────────────────────────────────────
 
@@ -476,22 +587,52 @@ class CompressApp(tk.Tk):
 
     def _set_all(self, state: bool):
         children = self._tree.get_children()
-        for idx, (row_id, var) in enumerate(zip(children, self._check_vars)):
+        for row_id in children:
+            idx = int(row_id)
+            var = self._check_vars[idx]
             var.set(state)
             vals = list(self._tree.item(row_id, "values"))
             vals[0] = "☑" if state else "☐"
             self._tree.item(row_id, values=vals, tags=("checked" if state else "unchecked",))
-        selected = sum(1 for v in self._check_vars if v.get())
-        self._set_status(f"{selected} / {len(self._check_vars)} file(s) selected.")
+        self._update_summary()
 
-    # ── Sort ───────────────────────────────────────────────────────────────────
+    # ── Sort ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _sort_key(col: str, value: str):
+        """Return a sort key that handles sizes, bitrates, and percentages numerically."""
+        if col in (COL_ORIG, COL_EST, COL_SAVE):
+            parts = value.split()
+            try:
+                return float(parts[0]) * _SIZE_UNITS.get(parts[1], 1)
+            except (IndexError, ValueError):
+                return -1  # N/A sorts first
+        if col == COL_BITRATE:
+            # "1234 kbps" → 1234
+            try:
+                return float(value.split()[0])
+            except (IndexError, ValueError):
+                return -1
+        if col == COL_PCT:
+            # "42%" → 42
+            try:
+                return float(value.rstrip("%"))
+            except ValueError:
+                return -1
+        return value.lower()
 
     def _sort_by(self, col):
-        """Simple alphabetical sort (good enough for size strings too)."""
-        items = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
-        items.sort()
+        """Sort tree rows by *col*, toggling ascending / descending on repeat click."""
+        reverse = self._sort_reverse.get(col, False)
+        items = [
+            (self._sort_key(col, self._tree.set(k, col)), k)
+            for k in self._tree.get_children("")
+        ]
+        items.sort(reverse=reverse)
         for rank, (_, k) in enumerate(items):
             self._tree.move(k, "", rank)
+        # Toggle direction for next click
+        self._sort_reverse[col] = not reverse
 
     # ── Pause / Resume ─────────────────────────────────────────────────────────
 

@@ -27,6 +27,7 @@ from compress_video import (
     compress_video,
     check_pause_between_videos,
     estimate_compressed_size,
+    format_size,
     probe_video,
     _parse_bitrate_to_kbps,
 )
@@ -47,14 +48,6 @@ ORIGINALS_FOLDER = "_originals_to_delete"
 
 # ── Helpers ──────────────────────────────────────────────────────
 
-def format_size(size_bytes: float) -> str:
-    """Return a human-readable file size string."""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(size_bytes) < 1024:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.2f} PB"
-
 
 def _scandir_recursive(root: str, min_bytes: int):
     """
@@ -69,7 +62,7 @@ def _scandir_recursive(root: str, min_bytes: int):
     with entries:
         for entry in entries:
             if entry.is_dir(follow_symlinks=False):
-                if entry.name == ORIGINALS_FOLDER:
+                if entry.name.startswith(".") or entry.name == ORIGINALS_FOLDER:
                     continue  # skip already-moved originals
                 yield from _scandir_recursive(entry.path, min_bytes)
             elif entry.is_file(follow_symlinks=False):
@@ -363,11 +356,15 @@ def main():
     overall_elapsed = time.time() - overall_start
 
     # ── Summary ──────────────────────────────────────────────────
-    succeeded = sum(1 for r in all_records if r["status"] == "ok")
-    skipped   = sum(1 for r in all_records if r["status"] == "skipped")
-    failed    = sum(1 for r in all_records if r["status"] == "failed")
-    total_saved = sum(r["original_size"] - r["new_size"]
-                      for r in all_records if r["status"] == "ok")
+    succeeded = skipped = failed = total_saved = 0
+    for r in all_records:
+        if r["status"] == "ok":
+            succeeded += 1
+            total_saved += r["original_size"] - r["new_size"]
+        elif r["status"] == "skipped":
+            skipped += 1
+        else:
+            failed += 1
 
     print(f"\n{'='*60}")
     print(f"  SUMMARY")

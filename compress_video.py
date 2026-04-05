@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import collections
 import ctypes
 import json
 import os
@@ -63,7 +64,6 @@ if _IS_WINDOWS:
 
     def _wait_for_resume_key():
         """Block until the user presses P/Space OR the GUI requests a resume."""
-        import time as _time
         _gui_resume.clear()  # discard any stale resume signal
         while True:
             if _gui_resume.is_set():
@@ -73,7 +73,7 @@ if _IS_WINDOWS:
                 key = msvcrt.getch()
                 if key in (b"p", b"P", b" "):
                     return
-            _time.sleep(0.1)
+            time.sleep(0.1)
 
 else:
     # Non-Windows fallback — pause not supported
@@ -132,7 +132,10 @@ def probe_video(input_path: str) -> dict:
     ]
     result_dict: dict = {"duration": None, "video_bitrate_kbps": None}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        kwargs = {}
+        if _IS_WINDOWS:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
         if proc.returncode != 0:
             return result_dict
         info = json.loads(proc.stdout)
@@ -153,7 +156,7 @@ def probe_video(input_path: str) -> dict:
     return result_dict
 
 
-def _format_size(size_bytes: float) -> str:
+def format_size(size_bytes: float) -> str:
     """Return a human-readable file size string."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(size_bytes) < 1024:
@@ -277,12 +280,12 @@ def compress_video(input_path: str, output_path: str, bitrate: str = "700k"):
     est_size = estimate_compressed_size(duration, effective_kbps)
     if est_size > 0:
         est_savings = original_size - est_size
-        print(f"[EST]  Estimated output: {_format_size(est_size)}  |  "
-              f"Savings: {_format_size(est_savings)}  "
+        print(f"[EST]  Estimated output: {format_size(est_size)}  |  "
+              f"Savings: {format_size(est_savings)}  "
               f"({est_savings / original_size * 100:.1f}%)"
               if est_savings > 0 else
-              f"[EST]  Estimated output: {_format_size(est_size)}  |  "
-              f"⚠ May be larger than original ({_format_size(original_size)})")
+              f"[EST]  Estimated output: {format_size(est_size)}  |  "
+              f"⚠ May be larger than original ({format_size(original_size)})")
 
     # Build FFmpeg command
     cmd = [
@@ -307,14 +310,18 @@ def compress_video(input_path: str, output_path: str, bitrate: str = "700k"):
     if _IS_WINDOWS:
         print(f"           Press P to pause / resume")
     try:
+        popen_kwargs = {}
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **popen_kwargs,
         )
 
-        stderr_lines = []
+        stderr_lines: collections.deque = collections.deque(maxlen=200)
 
         def _read_stderr():
             for line in proc.stderr:
@@ -377,9 +384,9 @@ def compress_video(input_path: str, output_path: str, bitrate: str = "700k"):
         )
         if compressed_size >= original_size:
             print(
-                f"[DISCARD] Compressed file ({_format_size(compressed_size)}) "
+                f"[DISCARD] Compressed file ({format_size(compressed_size)}) "
                 f"is not smaller than the original "
-                f"({_format_size(original_size)}). Discarding output."
+                f"({format_size(original_size)}). Discarding output."
             )
             os.remove(output_path)
             return None
