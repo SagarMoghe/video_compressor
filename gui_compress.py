@@ -23,7 +23,9 @@ from tkinter import filedialog, messagebox, ttk
 from compress_video import (
     _gui_pause,
     _gui_resume,
+    _gui_stop,
     _parse_bitrate_to_kbps,
+    create_subtitle_preview,
     estimate_compressed_size,
     format_size,
     probe_video,
@@ -113,18 +115,24 @@ def _inject_ffmpeg_path(ffmpeg_dir: str):
 
 DEFAULT_MIN_SIZE_GB = 0.0
 DEFAULT_BITRATE     = "700k"
+DEFAULT_ENCODER     = "av1_nvenc"
+DEFAULT_SUB_OFFSET  = "0.0"
+DEFAULT_PREVIEW_START = "0.0"
+DEFAULT_PREVIEW_DURATION = "30.0"
 COL_CHECK   = "Select"
 COL_NAME    = "File Name"
+COL_SUB     = "Subtitle"
 COL_ORIG    = "Original Size"
 COL_BITRATE = "Current Bitrate"
 COL_EST     = "Est. Output"
 COL_SAVE    = "Savings"
 COL_PCT     = "Save %"
-COLUMNS     = (COL_CHECK, COL_NAME, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
+COLUMNS     = (COL_CHECK, COL_NAME, COL_SUB, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
 
 # Pre-computed column indices for fast access in hot loops
 _IDX_CHECK   = COLUMNS.index(COL_CHECK)
 _IDX_NAME    = COLUMNS.index(COL_NAME)
+_IDX_SUB     = COLUMNS.index(COL_SUB)
 _IDX_ORIG    = COLUMNS.index(COL_ORIG)
 _IDX_BITRATE = COLUMNS.index(COL_BITRATE)
 _IDX_EST     = COLUMNS.index(COL_EST)
@@ -196,6 +204,7 @@ class CompressApp(tk.Tk):
         self._paused = False
         self._bitrate_refresh_id = None
         self._sort_reverse: dict[str, bool] = {}  # track sort direction per column
+        self._original_stdout = sys.stdout
 
         self._config = _load_config()
         self._build_ui()
@@ -204,6 +213,9 @@ class CompressApp(tk.Tk):
 
         # Redirect stdout so all print() / progress-bar writes appear in the log
         sys.stdout = _StdoutRedirector(self._log_queue, sys.stdout)
+
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -230,7 +242,38 @@ class CompressApp(tk.Tk):
         ttk.Entry(top, textvariable=self._bitrate_var, width=7).pack(side="left", padx=4)
         self._bitrate_var.trace_add("write", self._on_bitrate_changed)
 
+        ttk.Label(top, text="Encoder:").pack(side="left", padx=(8, 0))
+        self._encoder_var = tk.StringVar(value=DEFAULT_ENCODER)
+        encoder_combo = ttk.Combobox(
+            top, textvariable=self._encoder_var, width=14,
+            values=["av1_nvenc", "hevc_nvenc", "h264_nvenc", "libsvtav1", "libaom-av1", "libx265", "libx264"],
+        )
+        encoder_combo.pack(side="left", padx=4)
+
         ttk.Button(top, text="Scan", command=self._start_scan).pack(side="left", padx=8)
+
+        # ── Subtitle row ──────────────────────────────────────────────────────
+        sub_row = ttk.Frame(self)
+        sub_row.pack(fill="x", padx=6, pady=(0, 2))
+
+        ttk.Label(sub_row, text="Subtitle (.srt):").pack(side="left")
+        self._subtitle_var = tk.StringVar()
+        ttk.Entry(sub_row, textvariable=self._subtitle_var, width=60).pack(side="left", padx=4)
+        ttk.Button(sub_row, text="Browse…", command=self._browse_subtitle).pack(side="left")
+        self._preview_btn = ttk.Button(sub_row, text="Preview", command=self._preview_subtitle)
+        self._preview_btn.pack(side="left", padx=(6, 0))
+
+        ttk.Label(sub_row, text="Offset (s):").pack(side="left", padx=(10, 0))
+        self._subtitle_offset_var = tk.StringVar(value=DEFAULT_SUB_OFFSET)
+        ttk.Entry(sub_row, textvariable=self._subtitle_offset_var, width=8).pack(side="left", padx=4)
+
+        ttk.Label(sub_row, text="Start (s):").pack(side="left", padx=(8, 0))
+        self._preview_start_var = tk.StringVar(value=DEFAULT_PREVIEW_START)
+        ttk.Entry(sub_row, textvariable=self._preview_start_var, width=7).pack(side="left", padx=2)
+
+        ttk.Label(sub_row, text="Dur (s):").pack(side="left", padx=(6, 0))
+        self._preview_duration_var = tk.StringVar(value=DEFAULT_PREVIEW_DURATION)
+        ttk.Entry(sub_row, textvariable=self._preview_duration_var, width=7).pack(side="left", padx=2)
 
         # ── FFmpeg path row ────────────────────────────────────────────────────
         ff_row = ttk.Frame(self)
@@ -271,6 +314,7 @@ class CompressApp(tk.Tk):
         col_widths = {
             COL_CHECK:   55,
             COL_NAME:    320,
+            COL_SUB:     220,
             COL_ORIG:    110,
             COL_BITRATE: 120,
             COL_EST:     110,
@@ -294,6 +338,8 @@ class CompressApp(tk.Tk):
 
         ttk.Button(bot, text="Select All",   command=self._select_all).pack(side="left", padx=2)
         ttk.Button(bot, text="Deselect All", command=self._deselect_all).pack(side="left", padx=2)
+        ttk.Button(bot, text="Set Subtitle for Selected", command=self._assign_subtitle_to_selected).pack(side="left", padx=6)
+        ttk.Button(bot, text="Clear Subtitle for Selected", command=self._clear_subtitle_for_selected).pack(side="left", padx=2)
 
         self._compress_btn = ttk.Button(
             bot, text="Compress Selected", command=self._start_compress
@@ -342,8 +388,18 @@ class CompressApp(tk.Tk):
             _inject_ffmpeg_path(c["ffmpeg_dir"])
         if c.get("bitrate"):
             self._bitrate_var.set(c["bitrate"])
+        if c.get("encoder"):
+            self._encoder_var.set(c["encoder"])
         if c.get("min_size_gb") is not None:
             self._minsize_var.set(str(c["min_size_gb"]))
+        if c.get("subtitle_file"):
+            self._subtitle_var.set(c["subtitle_file"])
+        if c.get("subtitle_offset_s") is not None:
+            self._subtitle_offset_var.set(str(c["subtitle_offset_s"]))
+        if c.get("preview_start_s") is not None:
+            self._preview_start_var.set(str(c["preview_start_s"]))
+        if c.get("preview_duration_s") is not None:
+            self._preview_duration_var.set(str(c["preview_duration_s"]))
 
     def _persist_config(self):
         """Save current UI settings to the config file."""
@@ -354,6 +410,20 @@ class CompressApp(tk.Tk):
         if ffmpeg_dir:
             self._config["ffmpeg_dir"] = ffmpeg_dir
         self._config["bitrate"] = self._bitrate_var.get().strip()
+        self._config["encoder"] = self._encoder_var.get().strip()
+        self._config["subtitle_file"] = self._subtitle_var.get().strip()
+        try:
+            self._config["subtitle_offset_s"] = float(self._subtitle_offset_var.get())
+        except ValueError:
+            pass
+        try:
+            self._config["preview_start_s"] = float(self._preview_start_var.get())
+        except ValueError:
+            pass
+        try:
+            self._config["preview_duration_s"] = float(self._preview_duration_var.get())
+        except ValueError:
+            pass
         try:
             self._config["min_size_gb"] = float(self._minsize_var.get())
         except ValueError:
@@ -372,6 +442,180 @@ class CompressApp(tk.Tk):
             self._ffmpeg_var.set(path)
             _inject_ffmpeg_path(path)
             self._persist_config()
+
+    def _browse_subtitle(self):
+        path = filedialog.askopenfilename(
+            title="Select subtitle file",
+            filetypes=[("SubRip subtitles", "*.srt"), ("All files", "*.*")],
+        )
+        if path:
+            self._subtitle_var.set(path)
+            self._persist_config()
+
+    def _preview_subtitle(self):
+        if not self._ensure_ffmpeg():
+            return
+
+        source_video = None
+        source_video_idx = None
+        for v, var in zip(self._videos, self._check_vars):
+            if var.get():
+                source_video = v["path"]
+                source_video_idx = self._videos.index(v)
+                break
+        if source_video is None and self._videos:
+            source_video = self._videos[0]["path"]
+            source_video_idx = 0
+
+        subtitle_path = self._subtitle_var.get().strip()
+        if source_video_idx is not None:
+            subtitle_path = (self._videos[source_video_idx].get("_subtitle_path") or subtitle_path).strip()
+        if not subtitle_path:
+            messagebox.showwarning("Subtitle required", "Please choose an .srt subtitle file first, or assign one to the selected row.")
+            return
+        if not os.path.isfile(subtitle_path):
+            messagebox.showerror("Error", "Subtitle file does not exist. Please choose a valid .srt file.")
+            return
+
+        try:
+            subtitle_offset_s = float(self._subtitle_offset_var.get().strip() or "0")
+        except ValueError:
+            messagebox.showerror("Error", "Subtitle offset must be a number (seconds).")
+            return
+        try:
+            preview_start_s = float(self._preview_start_var.get().strip() or "0")
+        except ValueError:
+            messagebox.showerror("Error", "Preview start must be a number (seconds).")
+            return
+        try:
+            preview_duration_s = float(self._preview_duration_var.get().strip() or "30")
+        except ValueError:
+            messagebox.showerror("Error", "Preview duration must be a number (seconds).")
+            return
+        if preview_start_s < 0:
+            messagebox.showerror("Error", "Preview start cannot be negative.")
+            return
+        if preview_duration_s <= 0:
+            messagebox.showerror("Error", "Preview duration must be greater than zero.")
+            return
+
+        if source_video is None:
+            source_video = filedialog.askopenfilename(
+                title="Select a video to preview subtitles on",
+                filetypes=[("Video files", "*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v"), ("All files", "*.*")],
+            )
+            if not source_video:
+                return
+
+        base, _ = os.path.splitext(source_video)
+        start_tag = f"{int(round(preview_start_s))}s"
+        dur_tag = f"{int(round(preview_duration_s))}s"
+        output_path = f"{base}_subtitle_preview_{start_tag}_{dur_tag}.mp4"
+
+        self._preview_btn.state(["disabled"])
+        self._set_status("Generating subtitle preview clip…")
+        threading.Thread(
+            target=self._preview_worker,
+            args=(
+                source_video,
+                subtitle_path,
+                subtitle_offset_s,
+                output_path,
+                preview_start_s,
+                preview_duration_s,
+            ),
+            daemon=True,
+        ).start()
+
+    def _preview_worker(
+        self,
+        source_video: str,
+        subtitle_path: str,
+        subtitle_offset_s: float,
+        output_path: str,
+        preview_start_s: float,
+        preview_duration_s: float,
+    ):
+        ok = create_subtitle_preview(
+            source_video,
+            output_path,
+            subtitle_path,
+            subtitle_offset_s,
+            preview_seconds=preview_duration_s,
+            preview_start_s=preview_start_s,
+        )
+
+        def _finish():
+            self._preview_btn.state(["!disabled"])
+            if ok:
+                self._log(f"[PREVIEW] Created subtitle preview: {output_path}")
+                self._set_status(f"Subtitle preview ready: {output_path}")
+                if messagebox.askyesno("Preview ready", f"Preview created:\n{output_path}\n\nOpen now?"):
+                    try:
+                        os.startfile(output_path)
+                    except OSError as exc:
+                        messagebox.showwarning("Could not open preview", str(exc))
+            else:
+                self._set_status("Subtitle preview failed.")
+                messagebox.showerror(
+                    "Preview failed",
+                    "Could not generate subtitle preview. Check the log for ffmpeg details.",
+                )
+
+        self.after(0, _finish)
+
+    def _iter_checked_indices(self):
+        for idx, var in enumerate(self._check_vars):
+            if var.get():
+                yield idx
+
+    def _subtitle_display_for_video(self, video: dict) -> str:
+        sub = (video.get("_subtitle_path") or "").strip()
+        return os.path.basename(sub) if sub else "(default)"
+
+    def _update_row_subtitle_display(self, idx: int):
+        if idx >= len(self._videos):
+            return
+        row_id = str(idx)
+        if row_id not in self._tree.get_children():
+            return
+        vals = list(self._tree.item(row_id, "values"))
+        vals[_IDX_SUB] = self._subtitle_display_for_video(self._videos[idx])
+        self._tree.item(row_id, values=vals)
+
+    def _assign_subtitle_to_selected(self):
+        if not self._videos:
+            messagebox.showinfo("No files", "Scan a folder first.")
+            return
+        selected_idx = list(self._iter_checked_indices())
+        if not selected_idx:
+            messagebox.showwarning("Nothing selected", "Check one or more files first.")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Select subtitle file for selected rows",
+            filetypes=[("SubRip subtitles", "*.srt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        for idx in selected_idx:
+            self._videos[idx]["_subtitle_path"] = path
+            self._update_row_subtitle_display(idx)
+        self._set_status(f"Assigned subtitle to {len(selected_idx)} selected file(s): {os.path.basename(path)}")
+
+    def _clear_subtitle_for_selected(self):
+        if not self._videos:
+            return
+        selected_idx = list(self._iter_checked_indices())
+        if not selected_idx:
+            messagebox.showwarning("Nothing selected", "Check one or more files first.")
+            return
+
+        for idx in selected_idx:
+            self._videos[idx]["_subtitle_path"] = ""
+            self._update_row_subtitle_display(idx)
+        self._set_status(f"Cleared per-file subtitle on {len(selected_idx)} selected file(s).")
 
     def _ensure_ffmpeg(self) -> bool:
         """Inject ffmpeg dir into PATH and return True if ffmpeg is now accessible."""
@@ -451,6 +695,7 @@ class CompressApp(tk.Tk):
             orig      = v["size"]
             est       = v.get("_est_size", 0)
             orig_kbps = v.get("_probe", {}).get("video_bitrate_kbps")
+            v.setdefault("_subtitle_path", "")
             bitrate_str = f"{orig_kbps} kbps" if orig_kbps else "N/A"
             est_str, save_str, pct_str = _compute_row_strings(orig, est)
 
@@ -463,6 +708,7 @@ class CompressApp(tk.Tk):
                 values=(
                     "☑",
                     os.path.basename(v["path"]),
+                    self._subtitle_display_for_video(v),
                     format_size(orig),
                     bitrate_str,
                     est_str,
@@ -619,6 +865,8 @@ class CompressApp(tk.Tk):
                 return float(value.rstrip("%"))
             except ValueError:
                 return -1
+        if col == COL_SUB:
+            return value.lower()
         return value.lower()
 
     def _sort_by(self, col):
@@ -640,11 +888,30 @@ class CompressApp(tk.Tk):
         if self._paused:
             self._paused = False
             self._pause_btn.configure(text="⏸ Pause")
+            _gui_pause.clear()
             _gui_resume.set()
         else:
             self._paused = True
             self._pause_btn.configure(text="▶ Resume")
+            _gui_resume.clear()
             _gui_pause.set()
+
+    # ── Application close / cleanup ────────────────────────────────────────────
+
+    def _on_close(self):
+        """Handle window close: stop jobs, restore stdout, close all resources."""
+        # Signal background threads to stop
+        _gui_stop.set()
+        _gui_resume.set()  # unblock any paused compression
+
+        # Restore original stdout
+        sys.stdout = self._original_stdout
+
+        # Persist config
+        self._persist_config()
+
+        # Destroy the window
+        self.destroy()
 
     # ── Compress ───────────────────────────────────────────────────────────────
 
@@ -663,11 +930,40 @@ class CompressApp(tk.Tk):
             return
 
         bitrate = self._bitrate_var.get().strip() or DEFAULT_BITRATE
+        encoder = self._encoder_var.get().strip() or DEFAULT_ENCODER
         root    = self._folder_var.get().strip()
+        subtitle_path = self._subtitle_var.get().strip() or None
+        try:
+            subtitle_offset_s = float(self._subtitle_offset_var.get().strip() or "0")
+        except ValueError:
+            messagebox.showerror("Error", "Subtitle offset must be a number (seconds).")
+            return
 
+        if subtitle_path and not os.path.isfile(subtitle_path):
+            messagebox.showerror("Error", "Subtitle file does not exist. Please choose a valid .srt file.")
+            return
+
+        selected_entries = []
+        for v, var in zip(self._videos, self._check_vars):
+            if not var.get():
+                continue
+            per_file_sub = (v.get("_subtitle_path") or "").strip() or subtitle_path
+            if per_file_sub and not os.path.isfile(per_file_sub):
+                messagebox.showerror(
+                    "Error",
+                    f"Subtitle file does not exist for {os.path.basename(v['path'])}:\n{per_file_sub}",
+                )
+                return
+            selected_entries.append((v, per_file_sub))
+
+        with_sub_count = sum(1 for _, sub in selected_entries if sub)
+        subtitle_note = f"Subtitles on {with_sub_count}/{len(selected_entries)} selected file(s) ({subtitle_offset_s:+.3f}s)"
+        if with_sub_count == len(selected_entries) and subtitle_path:
+            subtitle_note += f"\nDefault: {os.path.basename(subtitle_path)}"
         if not messagebox.askyesno(
             "Confirm",
-            f"Compress {len(selected)} file(s) at {bitrate}?\n\n"
+            f"Compress {len(selected)} file(s) at {bitrate} with {encoder}?\n\n"
+            f"{subtitle_note}\n"
             "Originals will be moved to _originals_to_delete/",
         ):
             return
@@ -677,20 +973,40 @@ class CompressApp(tk.Tk):
         self._paused = False
         _gui_pause.clear()
         _gui_resume.clear()
+        _gui_stop.clear()
         self._job_running = True
         threading.Thread(
             target=self._compress_worker,
-            args=(selected, bitrate, root),
+            args=(selected_entries, bitrate, encoder, root, subtitle_offset_s),
             daemon=True,
         ).start()
 
-    def _compress_worker(self, videos: list[dict], bitrate: str, root: str):
-        total   = len(videos)
+    def _compress_worker(
+        self,
+        selected_entries: list[tuple[dict, str | None]],
+        bitrate: str,
+        encoder: str,
+        root: str,
+        subtitle_offset_s: float,
+    ):
+        total   = len(selected_entries)
         records = []
-        for i, v in enumerate(videos, 1):
+        for i, (v, subtitle_path) in enumerate(selected_entries, 1):
+            if _gui_stop.is_set():
+                self._log("\n[STOPPED] Compression aborted by user.")
+                break
             self._log(f"\n[{i}/{total}] {os.path.basename(v['path'])}")
             self.after(0, self._set_status, f"Compressing {i}/{total}: {os.path.basename(v['path'])}")
-            rec = _process_one(i, total, v, bitrate, root)
+            rec = _process_one(
+                i,
+                total,
+                v,
+                bitrate,
+                encoder,
+                root,
+                subtitle_path,
+                subtitle_offset_s,
+            )
             records.append(rec)
             status_icon = {"ok": "OK", "skipped": "SKIP", "failed": "FAIL"}.get(rec["status"], "?")
             self._log(f"  [{status_icon}] {os.path.basename(v['path'])}")

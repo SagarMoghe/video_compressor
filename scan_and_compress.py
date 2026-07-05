@@ -1,9 +1,10 @@
 """
 Recursively scan a directory for video files over 1 GB and compress them
-using H.264 NVEnc @ 700 kbps -> MP4.
+using AV1 (default: av1_nvenc) @ 700 kbps -> MP4.
 
 Usage:
     python scan_and_compress.py <input_path> [--min-size <GB>] [--bitrate <bitrate>]
+                                              [--encoder <ffmpeg_encoder>]
                                               [--workers <N>] [--dry-run]
 
 Examples:
@@ -115,7 +116,10 @@ def _process_one(
     total: int,
     video: dict,
     bitrate: str,
+    encoder: str,
     root: str,
+    subtitle_path: Optional[str] = None,
+    subtitle_offset_s: float = 0.0,
 ) -> dict:
     """
     Compress one video and move the original on success.
@@ -131,7 +135,14 @@ def _process_one(
     print(f"         Original size: {format_size(original_size)}")
     start = time.time()
 
-    result = compress_video(path, output_path, bitrate)
+    result = compress_video(
+        path,
+        output_path,
+        bitrate,
+        encoder,
+        subtitle_path,
+        subtitle_offset_s,
+    )
     elapsed = time.time() - start
 
     rec = {
@@ -180,7 +191,7 @@ def write_log(log_path: str, records: List[dict]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan for large videos and compress them with NVEnc H.264."
+        description="Scan for large videos and compress them with AV1 (default: av1_nvenc)."
     )
     parser.add_argument("input_path", help="Root directory to scan recursively.")
     parser.add_argument(
@@ -190,6 +201,18 @@ def main():
     parser.add_argument(
         "--bitrate", default="700k",
         help="Target video bitrate (default: 700k)."
+    )
+    parser.add_argument(
+        "--encoder", default="av1_nvenc",
+        help="FFmpeg video encoder (default: av1_nvenc).",
+    )
+    parser.add_argument(
+        "--subtitle", default=None,
+        help="Optional .srt subtitle file to burn into every output video.",
+    )
+    parser.add_argument(
+        "--subtitle-offset", type=float, default=0.0,
+        help="Subtitle offset in seconds (positive delays subtitles).",
     )
     parser.add_argument(
         "--workers", type=int, default=1,
@@ -215,11 +238,22 @@ def main():
     originals_dir = os.path.join(root, ORIGINALS_FOLDER)
     workers = max(1, args.workers)
 
+    if args.subtitle:
+        subtitle_path = os.path.abspath(args.subtitle)
+        if not os.path.isfile(subtitle_path):
+            print(f"[ERROR] Subtitle file not found: {subtitle_path}")
+            sys.exit(1)
+    else:
+        subtitle_path = None
+
     print(f"{'='*60}")
     print(f"  Video Compression Scanner")
     print(f"  Root path      : {root}")
     print(f"  Min size       : {format_size(min_bytes)}")
     print(f"  Bitrate        : {args.bitrate}")
+    print(f"  Encoder        : {args.encoder}")
+    print(f"  Subtitle       : {args.subtitle or 'None'}")
+    print(f"  Subtitle offset: {args.subtitle_offset:+.3f}s")
     print(f"  Workers        : {workers}")
     print(f"  Dry run        : {args.dry_run}")
     print(f"  Originals dir  : {originals_dir}")
@@ -341,14 +375,33 @@ def main():
         # Sequential — simpler output, no interleaving
         for i, v in enumerate(videos, 1):
             check_pause_between_videos()
-            rec = _process_one(i, total_count, v, args.bitrate, root)
+            rec = _process_one(
+                i,
+                total_count,
+                v,
+                args.bitrate,
+                args.encoder,
+                root,
+                subtitle_path,
+                args.subtitle_offset,
+            )
             all_records.append(rec)
     else:
         # Parallel — spin up a thread pool
         futures = {}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for i, v in enumerate(videos, 1):
-                fut = pool.submit(_process_one, i, total_count, v, args.bitrate, root)
+                fut = pool.submit(
+                    _process_one,
+                    i,
+                    total_count,
+                    v,
+                    args.bitrate,
+                    args.encoder,
+                    root,
+                    subtitle_path,
+                    args.subtitle_offset,
+                )
                 futures[fut] = v
             for fut in as_completed(futures):
                 all_records.append(fut.result())
