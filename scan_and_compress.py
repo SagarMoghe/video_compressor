@@ -135,42 +135,53 @@ def _process_one(
     print(f"         Original size: {format_size(original_size)}")
     start = time.time()
 
-    result = compress_video(
-        path,
-        output_path,
-        bitrate,
-        encoder,
-        subtitle_path,
-        subtitle_offset_s,
-    )
-    elapsed = time.time() - start
-
     rec = {
         "path": path,
         "original_size": original_size,
         "new_size": 0,
-        "elapsed": elapsed,
+        "elapsed": 0.0,
         "status": "failed",
         "moved_to": "",
     }
 
-    if result is True:
-        rec["status"] = "ok"
-        new_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
-        rec["new_size"] = new_size
-        savings = original_size - new_size
-        print(f"[OK] Finished in {elapsed:.1f}s  |  "
-              f"New size: {format_size(new_size)}  |  "
-              f"Saved: {format_size(savings)}")
-        moved = move_to_originals(path, root)
-        if moved:
-            rec["moved_to"] = moved
-            print(f"[MOVED] Original moved to: {moved}")
-    elif result is None:
-        rec["status"] = "skipped"
-        print(f"[SKIP] Skipped / discarded after {elapsed:.1f}s")
-    else:
-        print(f"[FAIL] Compression failed after {elapsed:.1f}s")
+    try:
+        result = compress_video(
+            path,
+            output_path,
+            bitrate,
+            encoder,
+            subtitle_path,
+            subtitle_offset_s,
+        )
+        elapsed = time.time() - start
+        rec["elapsed"] = elapsed
+
+        if result is True:
+            rec["status"] = "ok"
+            try:
+                new_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
+            except OSError as e:
+                print(f"[WARN] Could not read output size: {e}")
+                new_size = 0
+            rec["new_size"] = new_size
+            savings = original_size - new_size
+            print(f"[OK] Finished in {elapsed:.1f}s  |  "
+                  f"New size: {format_size(new_size)}  |  "
+                  f"Saved: {format_size(savings)}")
+            moved = move_to_originals(path, root)
+            if moved:
+                rec["moved_to"] = moved
+                print(f"[MOVED] Original moved to: {moved}")
+        elif result is None:
+            rec["status"] = "skipped"
+            print(f"[SKIP] Skipped / discarded after {elapsed:.1f}s")
+        else:
+            print(f"[FAIL] Compression failed after {elapsed:.1f}s")
+
+    except Exception as exc:
+        elapsed = time.time() - start
+        rec["elapsed"] = elapsed
+        print(f"[FAIL] Unexpected error after {elapsed:.1f}s: {exc}")
 
     return rec
 
@@ -402,9 +413,23 @@ def main():
                     subtitle_path,
                     args.subtitle_offset,
                 )
-                futures[fut] = v
+                futures[fut] = (i, v)
             for fut in as_completed(futures):
-                all_records.append(fut.result())
+                i, v = futures[fut]
+                try:
+                    all_records.append(fut.result())
+                except Exception as exc:
+                    print(f"[FAIL] Worker crashed on {v['path']}: {exc}")
+                    all_records.append(
+                        {
+                            "path": v["path"],
+                            "original_size": v["size"],
+                            "new_size": 0,
+                            "elapsed": 0.0,
+                            "status": "failed",
+                            "moved_to": "",
+                        }
+                    )
 
     overall_elapsed = time.time() - overall_start
 
@@ -436,7 +461,8 @@ def main():
     log_path = os.path.join(root, "compression_log.csv")
     write_log(log_path, all_records)
 
-    sys.exit(0 if failed == 0 else 1)
+    # Batch completed end-to-end even if some files failed.
+    sys.exit(0)
 
 
 if __name__ == "__main__":
