@@ -417,9 +417,12 @@ def main():
             for fut in as_completed(futures):
                 i, v = futures[fut]
                 try:
-                    all_records.append(fut.result())
+                    result = fut.result()
+                    all_records.append(result)
                 except Exception as exc:
                     print(f"[FAIL] Worker crashed on {v['path']}: {exc}")
+                    import traceback
+                    print(traceback.format_exc()[-500:])
                     all_records.append(
                         {
                             "path": v["path"],
