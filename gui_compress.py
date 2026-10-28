@@ -8,6 +8,7 @@ Workflow:
   4. Click "Compress Selected" → runs the job in a background thread.
 
 Requires: compress_video.py and scan_and_compress.py in the same directory.
+Optional English SRT generation: subtitle_gui.py and generate_subtitles.py.
 """
 
 import json
@@ -26,7 +27,7 @@ from compress_video import (
     _gui_stop,
     _parse_bitrate_to_kbps,
     create_subtitle_preview,
-    estimate_compressed_size,
+    update_size_estimate,
     format_size,
     probe_video,
 )
@@ -131,12 +132,8 @@ COL_PCT     = "Save %"
 COLUMNS     = (COL_CHECK, COL_NAME, COL_SUB, COL_SUB_OFF, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
 
 # Pre-computed column indices for fast access in hot loops
-_IDX_CHECK   = COLUMNS.index(COL_CHECK)
-_IDX_NAME    = COLUMNS.index(COL_NAME)
 _IDX_SUB     = COLUMNS.index(COL_SUB)
 _IDX_SUB_OFF = COLUMNS.index(COL_SUB_OFF)
-_IDX_ORIG    = COLUMNS.index(COL_ORIG)
-_IDX_BITRATE = COLUMNS.index(COL_BITRATE)
 _IDX_EST     = COLUMNS.index(COL_EST)
 _IDX_SAVE    = COLUMNS.index(COL_SAVE)
 _IDX_PCT     = COLUMNS.index(COL_PCT)
@@ -151,10 +148,7 @@ def _probe_and_estimate(video: dict, target_kbps: int) -> dict:
     """Add _probe / _est_size keys to the video dict and return it."""
     probe = probe_video(video["path"])
     video["_probe"] = probe
-    orig_kbps = probe.get("video_bitrate_kbps")
-    duration  = probe.get("duration")
-    eff_kbps  = min(orig_kbps, target_kbps) if orig_kbps else target_kbps
-    video["_est_size"] = estimate_compressed_size(duration, eff_kbps) if duration else 0
+    update_size_estimate(video, target_kbps)
     return video
 
 
@@ -203,6 +197,7 @@ class CompressApp(tk.Tk):
         self._check_vars: list[tk.BooleanVar] = []
         self._log_queue: queue.Queue = queue.Queue()
         self._job_running = False
+        self._subtitle_window = None
         self._paused = False
         self._bitrate_refresh_id = None
         self._sort_reverse: dict[str, bool] = {}  # track sort direction per column
@@ -264,6 +259,9 @@ class CompressApp(tk.Tk):
         ttk.Button(sub_row, text="Browse…", command=self._browse_subtitle).pack(side="left")
         self._preview_btn = ttk.Button(sub_row, text="Preview", command=self._preview_subtitle)
         self._preview_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(
+            sub_row, text="Generate English SRT...", command=self._open_subtitle_generator,
+        ).pack(side="left", padx=(6, 0))
 
         ttk.Label(sub_row, text="Offset (s):").pack(side="left", padx=(10, 0))
         self._subtitle_offset_var = tk.StringVar(value=DEFAULT_SUB_OFFSET)
@@ -392,51 +390,37 @@ class CompressApp(tk.Tk):
         c = self._config
         if c.get("recent_folders"):
             self._folder_var.set(c["recent_folders"][0])
-        if c.get("ffmpeg_dir"):
-            self._ffmpeg_var.set(c["ffmpeg_dir"])
-            _inject_ffmpeg_path(c["ffmpeg_dir"])
-        if c.get("bitrate"):
-            self._bitrate_var.set(c["bitrate"])
-        if c.get("encoder"):
-            self._encoder_var.set(c["encoder"])
-        if c.get("min_size_gb") is not None:
-            self._minsize_var.set(str(c["min_size_gb"]))
-        if c.get("subtitle_file"):
-            self._subtitle_var.set(c["subtitle_file"])
-        if c.get("subtitle_offset_s") is not None:
-            self._subtitle_offset_var.set(str(c["subtitle_offset_s"]))
-        if c.get("preview_start_s") is not None:
-            self._preview_start_var.set(str(c["preview_start_s"]))
-        if c.get("preview_duration_s") is not None:
-            self._preview_duration_var.set(str(c["preview_duration_s"]))
+        for key, (variable, convert) in self._config_fields().items():
+            value = c.get(key)
+            if value is not None and (convert is float or value):
+                variable.set(str(value))
+        _inject_ffmpeg_path(self._ffmpeg_var.get().strip())
+
+    def _config_fields(self):
+        return {
+            "ffmpeg_dir": (self._ffmpeg_var, str),
+            "bitrate": (self._bitrate_var, str),
+            "encoder": (self._encoder_var, str),
+            "subtitle_file": (self._subtitle_var, str),
+            "min_size_gb": (self._minsize_var, float),
+            "subtitle_offset_s": (self._subtitle_offset_var, float),
+            "preview_start_s": (self._preview_start_var, float),
+            "preview_duration_s": (self._preview_duration_var, float),
+        }
 
     def _persist_config(self):
         """Save current UI settings to the config file."""
         folder = self._folder_var.get().strip()
         if folder:
             self._config = _add_recent_folder(self._config, folder)
-        ffmpeg_dir = self._ffmpeg_var.get().strip()
-        if ffmpeg_dir:
-            self._config["ffmpeg_dir"] = ffmpeg_dir
-        self._config["bitrate"] = self._bitrate_var.get().strip()
-        self._config["encoder"] = self._encoder_var.get().strip()
-        self._config["subtitle_file"] = self._subtitle_var.get().strip()
-        try:
-            self._config["subtitle_offset_s"] = float(self._subtitle_offset_var.get())
-        except ValueError:
-            pass
-        try:
-            self._config["preview_start_s"] = float(self._preview_start_var.get())
-        except ValueError:
-            pass
-        try:
-            self._config["preview_duration_s"] = float(self._preview_duration_var.get())
-        except ValueError:
-            pass
-        try:
-            self._config["min_size_gb"] = float(self._minsize_var.get())
-        except ValueError:
-            pass
+        for key, (variable, convert) in self._config_fields().items():
+            value = variable.get().strip()
+            if key == "ffmpeg_dir" and not value:
+                continue
+            try:
+                self._config[key] = convert(value)
+            except ValueError:
+                self._log(f"[WARN] Invalid {key}; keeping its previous saved value.")
         _save_config(self._config)
 
     def _browse_folder(self):
@@ -461,20 +445,45 @@ class CompressApp(tk.Tk):
             self._subtitle_var.set(path)
             self._persist_config()
 
+    def _open_subtitle_generator(self):
+        if self._job_running:
+            messagebox.showinfo("Running", "Wait for compression to finish before generating subtitles.")
+            return
+        if self._subtitle_window is not None and self._subtitle_window.winfo_exists():
+            self._subtitle_window.deiconify()
+            self._subtitle_window.lift()
+            return
+        from subtitle_gui import SubtitleWindow
+
+        videos = [self._videos[idx]["path"] for idx in self._iter_checked_indices()]
+        self._subtitle_window = SubtitleWindow(
+            self, videos, self._on_subtitle_generated, self._log,
+            lambda: self._job_running,
+        )
+
+    def _subtitles_running(self) -> bool:
+        return (
+            self._subtitle_window is not None
+            and self._subtitle_window.winfo_exists()
+            and self._subtitle_window.running
+        )
+
+    def _on_subtitle_generated(self, video_path: str, subtitle_path: str):
+        normalized = os.path.normcase(os.path.abspath(video_path))
+        for idx, video in enumerate(self._videos):
+            if os.path.normcase(os.path.abspath(video["path"])) == normalized:
+                video["_subtitle_path"] = subtitle_path
+                video["_subtitle_offset"] = 0.0
+                self._update_row_subtitle_display(idx)
+
     def _preview_subtitle(self):
         if not self._ensure_ffmpeg():
             return
 
         source_video = None
-        source_video_idx = None
-        for v, var in zip(self._videos, self._check_vars):
-            if var.get():
-                source_video = v["path"]
-                source_video_idx = self._videos.index(v)
-                break
-        if source_video is None and self._videos:
-            source_video = self._videos[0]["path"]
-            source_video_idx = 0
+        source_video_idx = next(self._iter_checked_indices(), 0 if self._videos else None)
+        if source_video_idx is not None:
+            source_video = self._videos[source_video_idx]["path"]
 
         subtitle_path = self._subtitle_var.get().strip()
         if source_video_idx is not None:
@@ -716,7 +725,6 @@ class CompressApp(tk.Tk):
     # ── Table population ───────────────────────────────────────────────────────
 
     def _populate_table(self, videos: list[dict]):
-        self._check_vars = []
         self._clear_table()
         self._videos = videos  # must be set AFTER _clear_table resets it
 
@@ -778,13 +786,7 @@ class CompressApp(tk.Tk):
         children = self._tree.get_children()
         for row_id in children:
             v = self._videos[int(row_id)]
-            probe     = v.get("_probe", {})
-            orig_kbps = probe.get("video_bitrate_kbps")
-            duration  = probe.get("duration")
-
-            eff_kbps = min(orig_kbps, target_kbps) if orig_kbps else target_kbps
-            est = estimate_compressed_size(duration, eff_kbps) if duration else 0
-            v["_est_size"] = est
+            est = update_size_estimate(v, target_kbps)
 
             est_str, save_str, pct_str = _compute_row_strings(v["size"], est)
 
@@ -941,6 +943,13 @@ class CompressApp(tk.Tk):
 
     def _on_close(self):
         """Handle window close: stop jobs, restore stdout, close all resources."""
+        if self._subtitles_running():
+            self._subtitle_window._request_cancel()
+            messagebox.showinfo(
+                "Cancelling subtitles",
+                "Wait for the current model load or inference step to finish, then close again.",
+            )
+            return
         # Signal background threads to stop
         _gui_stop.set()
         _gui_resume.set()  # unblock any paused compression
@@ -957,15 +966,16 @@ class CompressApp(tk.Tk):
     # ── Compress ───────────────────────────────────────────────────────────────
 
     def _start_compress(self):
+        if self._subtitles_running():
+            messagebox.showinfo("Running", "Wait for subtitle generation to finish before compressing.")
+            return
         if not self._ensure_ffmpeg():
             return
         if self._job_running:
             messagebox.showinfo("Running", "A compression job is already running.")
             return
 
-        selected = [
-            v for v, var in zip(self._videos, self._check_vars) if var.get()
-        ]
+        selected = [self._videos[idx] for idx in self._iter_checked_indices()]
         if not selected:
             messagebox.showwarning("Nothing selected", "Please select at least one file.")
             return
@@ -985,9 +995,7 @@ class CompressApp(tk.Tk):
             return
 
         selected_entries = []
-        for v, var in zip(self._videos, self._check_vars):
-            if not var.get():
-                continue
+        for v in selected:
             per_file_sub = (v.get("_subtitle_path") or "").strip() or subtitle_path
             per_file_offset = v.get("_subtitle_offset", 0.0) if (v.get("_subtitle_path") or "").strip() else subtitle_offset_s
             if per_file_sub and not os.path.isfile(per_file_sub):

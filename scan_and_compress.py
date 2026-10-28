@@ -28,7 +28,7 @@ from compress_video import (
     compress_video,
     check_pause_between_videos,
     build_compressed_output_path,
-    estimate_compressed_size,
+    update_size_estimate,
     format_size,
     probe_video,
     _parse_bitrate_to_kbps,
@@ -77,7 +77,6 @@ def _scandir_recursive(root: str, min_bytes: int):
                 except OSError:
                     continue
                 if size >= min_bytes:
-                    name_lower = entry.name.lower()
                     if "_compressed" in name_lower and name_lower.endswith(".mp4"):
                         continue
                     yield entry.path, size
@@ -288,12 +287,7 @@ def main():
     for i, v in enumerate(videos, 1):
         probe = probe_video(v["path"])
         v["_probe"] = probe  # cache for later
-        orig_kbps = probe.get("video_bitrate_kbps")
-        duration = probe.get("duration")
-
-        eff_kbps = min(orig_kbps, target_kbps) if orig_kbps else target_kbps
-        est = estimate_compressed_size(duration, eff_kbps) if duration else 0
-        v["_est_size"] = est
+        est = update_size_estimate(v, target_kbps)
         est_savings = v["size"] - est if est > 0 else 0
         total_est += est
 

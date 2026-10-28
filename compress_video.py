@@ -1,18 +1,6 @@
-"""
-Compress a single video file using AV1 (default: libsvtav1).
-Target bitrate = min(original_bitrate, requested_bitrate).
-Output format: MP4.  Press P during encoding to pause / resume.
+"""Compress to MP4 with bitrate capping, encoder fallbacks and subtitle burn-in.
 
-FAILURE MINIMIZATION STRATEGIES:
-  1. Fallback encoder chain (HW → SW, GPU → CPU)
-  2. Adaptive bitrate reduction on encode failure
-  3. Error-tolerant FFmpeg flags (-err_detect ignore_err, -fflags +discardcorrupt)
-  4. Pre-flight input validation
-  5. Retry logic with progressive fallbacks
-
-Usage:
-    python compress_video.py <input_file> [--output <output_file>] [--bitrate <bitrate>]
-                           [--encoder <ffmpeg_encoder>]
+Run ``python compress_video.py --help`` for command-line options.
 """
 
 import argparse
@@ -28,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 
 # ── GUI pause/resume/stop hooks ───────────────────────────────────
 _gui_pause  = threading.Event()
@@ -36,6 +25,16 @@ _gui_stop   = threading.Event()
 
 # ── Platform-specific keyboard / process helpers ─────────────────
 _IS_WINDOWS = platform.system() == "Windows"
+_PROCESS_OPTIONS = {
+    "text": True, "encoding": "utf-8", "errors": "replace",
+}
+if _IS_WINDOWS:
+    _PROCESS_OPTIONS["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+_INPUT_OPTIONS = [
+    "-probesize", "50M", "-analyzeduration", "100M",
+    "-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+]
 
 if _IS_WINDOWS:
     import msvcrt
@@ -136,10 +135,7 @@ def probe_video(input_path: str) -> dict:
     cmd = [
         "ffprobe",
         "-v", "quiet",
-        "-probesize", "50M",
-        "-analyzeduration", "100M",
-        "-fflags", "+discardcorrupt",
-        "-err_detect", "ignore_err",
+        *_INPUT_OPTIONS,
         "-print_format", "json",
         "-show_format",
         "-show_streams",
@@ -148,17 +144,7 @@ def probe_video(input_path: str) -> dict:
     ]
     result_dict: dict = {"duration": None, "video_bitrate_kbps": None}
     try:
-        kwargs = {}
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **kwargs,
-        )
+        proc = subprocess.run(cmd, capture_output=True, **_PROCESS_OPTIONS)
         if proc.returncode != 0:
             return result_dict
         info = json.loads(proc.stdout)
@@ -225,10 +211,7 @@ def _check_gpu_available(encoder: str) -> bool:
     """Check whether FFmpeg exposes the requested encoder."""
     try:
         cmd = ["ffmpeg", "-hide_banner", "-encoders"]
-        kwargs = {}
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.run(cmd, capture_output=True, text=True, **kwargs, timeout=5)
+        proc = subprocess.run(cmd, capture_output=True, **_PROCESS_OPTIONS, timeout=5)
         return encoder.lower() in proc.stdout.lower()
     except Exception:
         return False
@@ -297,6 +280,15 @@ def estimate_compressed_size(
         return 0
     bits = (video_bitrate_kbps + audio_bitrate_kbps) * 1000 * duration_s
     return int(bits / 8 * _CONTAINER_OVERHEAD)
+
+
+def update_size_estimate(video: dict, target_kbps: int) -> int:
+    """Update an estimate using cached probe data, shared by the GUI and CLI."""
+    probe = video.get("_probe", {})
+    original_kbps = probe.get("video_bitrate_kbps")
+    effective_kbps = min(original_kbps, target_kbps) if original_kbps else target_kbps
+    video["_est_size"] = estimate_compressed_size(probe.get("duration"), effective_kbps)
+    return video["_est_size"]
 
 
 def print_progress_bar(
@@ -412,6 +404,26 @@ def _escape_subtitles_path(path: str) -> str:
     return norm
 
 
+@contextmanager
+def _subtitle_filter(subtitle_path: str | None, offset_s: float):
+    """Prepare a burn-in filter and always release any shifted subtitle file."""
+    shifted_path = None
+    try:
+        if not subtitle_path:
+            yield None
+            return
+        source = os.path.abspath(subtitle_path)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(f"Subtitle file not found: {source}")
+        if abs(offset_s) > 1e-9:
+            shifted_path = _shift_srt_file(source, offset_s)
+            source = shifted_path
+        yield f"subtitles='{_escape_subtitles_path(source)}'"
+    finally:
+        if shifted_path:
+            _cleanup_output_path(shifted_path)
+
+
 def _toggle_ffmpeg_pause(proc: subprocess.Popen) -> bool:
     """Toggle ffmpeg's built-in pause state by writing 'p' to stdin."""
     try:
@@ -424,12 +436,24 @@ def _toggle_ffmpeg_pause(proc: subprocess.Popen) -> bool:
     return False
 
 
+def _pause_encoding(proc: subprocess.Popen, current: float, duration: float | None, start: float):
+    if not _toggle_ffmpeg_pause(proc):
+        _suspend_process(proc.pid)
+    if duration:
+        print_progress_bar(current, duration, paused=True, start_time=start)
+    print("\n[PAUSED] FFmpeg suspended. Press P or click Resume to continue.")
+    _wait_for_resume_key()
+    if not _toggle_ffmpeg_pause(proc):
+        _resume_process(proc.pid)
+    print("[RESUMED] Encoding continues.")
+
+
 def _cleanup_output_path(output_path: str):
     if os.path.isfile(output_path):
         try:
             os.remove(output_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f"[WARN] Could not remove {output_path}: {exc}")
 
 
 def _remux_to_mp4_copy(input_path: str, output_path: str) -> bool:
@@ -437,10 +461,7 @@ def _remux_to_mp4_copy(input_path: str, output_path: str) -> bool:
     cmd = [
         "ffmpeg",
         "-y",
-        "-probesize", "50M",
-        "-analyzeduration", "100M",
-        "-fflags", "+discardcorrupt",
-        "-err_detect", "ignore_err",
+        *_INPUT_OPTIONS,
         "-i", input_path,
         "-map", "0",
         "-c", "copy",
@@ -448,25 +469,15 @@ def _remux_to_mp4_copy(input_path: str, output_path: str) -> bool:
         output_path,
     ]
     try:
-        kwargs = {}
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **kwargs,
-        )
+        proc = subprocess.run(cmd, capture_output=True, **_PROCESS_OPTIONS)
         if proc.returncode == 0 and _is_valid_output_media(output_path):
             return True
-        if os.path.isfile(output_path):
-            os.remove(output_path)
+        print(f"[WARN] MP4 remux failed: {proc.stderr[-500:]}")
+        _cleanup_output_path(output_path)
         return False
-    except Exception:
-        if os.path.isfile(output_path):
-            os.remove(output_path)
+    except OSError as exc:
+        print(f"[WARN] MP4 remux failed: {exc}")
+        _cleanup_output_path(output_path)
         return False
 
 
@@ -484,9 +495,7 @@ def _attempt_encode(
     """Attempt a single encode. Returns (success, fatal_encoder_failure)."""
     cmd = [
         "ffmpeg",
-        "-y", "-probesize", "50M", "-analyzeduration", "100M",
-        "-fflags", "+discardcorrupt",
-        "-err_detect", "ignore_err",
+        "-y", *_INPUT_OPTIONS,
         "-i", input_path,
     ]
     if subtitle_filter:
@@ -510,18 +519,12 @@ def _attempt_encode(
     cmd.append(output_path)
 
     try:
-        popen_kwargs = {}
-        if _IS_WINDOWS:
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **popen_kwargs,
+            **_PROCESS_OPTIONS,
         )
 
         stderr_lines: collections.deque = collections.deque(maxlen=200)
@@ -533,7 +536,6 @@ def _attempt_encode(
         t = threading.Thread(target=_read_stderr, daemon=True)
         t.start()
 
-        paused = False
         last_progress_s = 0.0
         encode_start = time.time()
 
@@ -552,23 +554,7 @@ def _attempt_encode(
                     return False, False
 
                 if _pause_key_pressed():
-                    if not paused:
-                        if not _toggle_ffmpeg_pause(proc):
-                            _suspend_process(proc.pid)
-                        paused = True
-                        print_progress_bar(
-                            last_progress_s, duration, paused=True,
-                            start_time=encode_start,
-                        )
-                        print(
-                            "\n[PAUSED] FFmpeg suspended. "
-                            "Press P to resume …"
-                        )
-                        _wait_for_resume_key()
-                        if not _toggle_ffmpeg_pause(proc):
-                            _resume_process(proc.pid)
-                        paused = False
-                        print("[RESUMED] Encoding continues …")
+                    _pause_encoding(proc, last_progress_s, duration, encode_start)
 
                 line = line.strip()
                 if line.startswith("out_time="):
@@ -587,16 +573,8 @@ def _attempt_encode(
                     proc.wait(timeout=5)
                     _cleanup_output_path(output_path)
                     return False, False
-                if _pause_key_pressed() and not paused:
-                    if not _toggle_ffmpeg_pause(proc):
-                        _suspend_process(proc.pid)
-                    paused = True
-                    print("\n[PAUSED] FFmpeg suspended. Press P to resume …")
-                    _wait_for_resume_key()
-                    if not _toggle_ffmpeg_pause(proc):
-                        _resume_process(proc.pid)
-                    paused = False
-                    print("[RESUMED] Encoding continues …")
+                if _pause_key_pressed():
+                    _pause_encoding(proc, last_progress_s, duration, encode_start)
                 time.sleep(0.1)
 
         proc.wait()
@@ -683,8 +661,6 @@ def compress_video(
         print(f"[WARN] Could not detect original bitrate. "
               f"Using target: {target_kbps} kbps")
 
-    effective_bitrate = f"{effective_kbps}k"
-
     # ── Estimated output size ────────────────────────────────────
     est_size = estimate_compressed_size(duration, effective_kbps)
     if est_size > 0:
@@ -696,119 +672,65 @@ def compress_video(
               f"[EST]  Estimated output: {format_size(est_size)}  |  "
               f"⚠ May be larger than original ({format_size(original_size)})")
 
-    shifted_subtitle_path = None
-    subtitle_filter = None
-    if subtitle_path:
-        subtitle_path = os.path.abspath(subtitle_path)
-        if not os.path.isfile(subtitle_path):
-            print(f"[ERROR] Subtitle file not found: {subtitle_path}")
-            return False
-        source_subtitle = subtitle_path
-        if abs(subtitle_offset_s) > 1e-9:
-            shifted_subtitle_path = _shift_srt_file(subtitle_path, subtitle_offset_s)
-            source_subtitle = shifted_subtitle_path
-            print(f"[INFO] Applied subtitle offset: {subtitle_offset_s:+.3f}s")
-        subtitle_filter = f"subtitles='{_escape_subtitles_path(source_subtitle)}'"
-        print(f"[INFO] Burning subtitles from: {subtitle_path}")
+    try:
+        with _subtitle_filter(subtitle_path, subtitle_offset_s) as subtitle_filter:
+            return _encode_with_retries(
+                input_path, output_path, encoder, effective_kbps, duration,
+                subtitle_filter, original_size, is_already_mp4,
+            )
+    except OSError as exc:
+        print(f"[ERROR] Compression failed: {exc}")
+        return False
 
-    # ── Try encoding with fallback logic ─────────────────────────
+
+def _encode_with_retries(
+    input_path: str, output_path: str, encoder: str, effective_kbps: int,
+    duration: float | None, subtitle_filter: str | None,
+    original_size: int, is_already_mp4: bool,
+) -> bool | None:
     print(f"[COMPRESS] Encoding: {os.path.basename(input_path)}")
-    if _IS_WINDOWS:
-        print(f"           Press P to pause / resume")
-
-    encoders_to_try = []
+    encoders = []
     for candidate in [encoder] + _get_fallback_encoders(encoder):
-        if candidate in encoders_to_try:
-            continue
         if _check_gpu_available(candidate):
-            encoders_to_try.append(candidate)
+            encoders.append(candidate)
         else:
-            print(f"[WARN] Encoder '{candidate}' is not available in this FFmpeg build; skipping.")
-
-    if not encoders_to_try:
+            print(f"[WARN] Encoder '{candidate}' is not available; skipping.")
+    if not encoders:
         print("[ERROR] No usable encoders are available.")
         return False
+    bitrates = [effective_kbps]
+    while bitrates[-1] > 200:
+        bitrates.append(int(bitrates[-1] * 0.8))
 
-    bitrates_to_try = [effective_kbps]
-    current_br = effective_kbps
-    while current_br > 200:
-        current_br = int(current_br * 0.8)
-        bitrates_to_try.append(current_br)
+    for candidate in encoders:
+        for kbps in bitrates:
+            if _gui_stop.is_set():
+                return False
+            print(f"[ATTEMPT] Encoder: {candidate} | Bitrate: {kbps}k")
+            success, fatal = _attempt_encode(
+                input_path, output_path, candidate, f"{kbps}k", kbps,
+                duration, subtitle_filter,
+            )
+            if fatal:
+                print(f"[WARN] Encoder '{candidate}' is incompatible; trying the next encoder.")
+                break
+            if not success:
+                continue
+            if not _is_valid_output_media(output_path):
+                print(f"[ERROR] Output file failed validation: {output_path}")
+                _cleanup_output_path(output_path)
+                return False
+            if os.path.getsize(output_path) >= original_size:
+                if is_already_mp4 and not subtitle_filter:
+                    print("[DISCARD] Output is not smaller than the original MP4.")
+                    _cleanup_output_path(output_path)
+                    return None
+                print("[KEEP] Larger output retained for MP4 conversion or subtitle burn-in.")
+            print(f"[OK] Compressed successfully -> {output_path}")
+            return True
 
-    try:
-        total_attempts = len(encoders_to_try) * len(bitrates_to_try)
-        for enc_idx, try_encoder in enumerate(encoders_to_try):
-            for br_idx, try_kbps in enumerate(bitrates_to_try):
-                try_bitrate = f"{try_kbps}k"
-                attempt_num = enc_idx * len(bitrates_to_try) + br_idx + 1
-                if attempt_num > 1:
-                    print(f"\n[RETRY {attempt_num}/{total_attempts}] "
-                          f"Encoder: {try_encoder}  |  Bitrate: {try_bitrate}")
-
-                success, fatal_encoder_failure = _attempt_encode(
-                    input_path,
-                    output_path,
-                    try_encoder,
-                    try_bitrate,
-                    try_kbps,
-                    duration,
-                    subtitle_filter,
-                )
-
-                if fatal_encoder_failure:
-                    print(
-                        f"[WARN] Encoder '{try_encoder}' reported a non-retryable "
-                        "compatibility failure. Trying the next encoder."
-                    )
-                    break
-
-                if success:
-                    print(f"[OK] Encoding succeeded with {try_encoder} @ {try_bitrate}")
-                    if not _is_valid_output_media(output_path):
-                        print(f"[ERROR] Output file failed validation: {output_path}")
-                        _cleanup_output_path(output_path)
-                        return False
-
-                    compressed_size = (
-                        os.path.getsize(output_path) if os.path.isfile(output_path) else 0
-                    )
-                    if compressed_size >= original_size:
-                        if is_already_mp4 and not has_subtitles:
-                            print(
-                                f"[DISCARD] Compressed file ({format_size(compressed_size)}) "
-                                f"is not smaller than the original "
-                                f"({format_size(original_size)}). Discarding output."
-                            )
-                            _cleanup_output_path(output_path)
-                            return None
-                        if has_subtitles:
-                            print(
-                                f"[KEEP] Compressed file ({format_size(compressed_size)}) "
-                                f"is not smaller than the original "
-                                f"({format_size(original_size)}), but keeping output "
-                                f"because subtitles were burned in."
-                            )
-                        else:
-                            print(
-                                f"[KEEP] Compressed file ({format_size(compressed_size)}) "
-                                f"is not smaller than the original "
-                                f"({format_size(original_size)}), but keeping MP4 "
-                                f"(original was not MP4)."
-                            )
-
-                    print(f"[OK] Compressed successfully -> {output_path}")
-                    return True
-
-        print(f"\n[ERROR] All {total_attempts} encode attempts failed. "
-              f"({len(encoders_to_try)} encoders × {len(bitrates_to_try)} bitrates)")
-        return False
-
-    finally:
-        if shifted_subtitle_path and os.path.isfile(shifted_subtitle_path):
-            try:
-                os.remove(shifted_subtitle_path)
-            except OSError:
-                pass
+    print("[ERROR] All available encoder/bitrate attempts failed.")
+    return False
 
 
 def create_subtitle_preview(
@@ -827,59 +749,29 @@ def create_subtitle_preview(
         print(f"[ERROR] Subtitle file not found: {subtitle_path}")
         return False
 
-    shifted_subtitle_path = None
     try:
-        source_subtitle = os.path.abspath(subtitle_path)
         start_s = max(0.0, float(preview_start_s))
         duration_s = max(1.0, float(preview_seconds))
 
-        preview_sub_shift_s = float(subtitle_offset_s) - start_s
-        if abs(preview_sub_shift_s) > 1e-9:
-            shifted_subtitle_path = _shift_srt_file(source_subtitle, preview_sub_shift_s)
-            source_subtitle = shifted_subtitle_path
-
-        subtitle_filter = f"subtitles='{_escape_subtitles_path(source_subtitle)}'"
         print(
             f"[PREVIEW] start={start_s:.3f}s  duration={duration_s:.3f}s  "
             f"subtitle_offset={float(subtitle_offset_s):+.3f}s"
         )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-probesize", "50M",
-            "-analyzeduration", "100M",
-            "-fflags", "+discardcorrupt",
-            "-err_detect", "ignore_err",
-            "-ss", f"{start_s:.3f}",
-            "-t", f"{duration_s:.3f}",
-            "-i", input_path,
-            "-vf", subtitle_filter,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-
-        kwargs = {}
-        if _IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **kwargs,
-        )
+        with _subtitle_filter(subtitle_path, float(subtitle_offset_s) - start_s) as subtitle_filter:
+            cmd = [
+                "ffmpeg", "-y", *_INPUT_OPTIONS,
+                "-ss", f"{start_s:.3f}", "-t", f"{duration_s:.3f}",
+                "-i", input_path, "-vf", subtitle_filter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", _AUDIO_CODEC, "-b:a", f"{_AUDIO_BITRATE_KBPS}k",
+                "-movflags", "+faststart", output_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, **_PROCESS_OPTIONS)
         if proc.returncode != 0:
             print("[ERROR] Failed to generate subtitle preview clip.")
             err = proc.stderr or ""
             print(err[-2000:] if len(err) > 2000 else err)
-            if os.path.isfile(output_path):
-                os.remove(output_path)
+            _cleanup_output_path(output_path)
             return False
         return os.path.isfile(output_path)
     except FileNotFoundError:
@@ -887,15 +779,8 @@ def create_subtitle_preview(
         return False
     except Exception as exc:
         print(f"[ERROR] Subtitle preview failed: {exc}")
-        if os.path.isfile(output_path):
-            os.remove(output_path)
+        _cleanup_output_path(output_path)
         return False
-    finally:
-        if shifted_subtitle_path and os.path.isfile(shifted_subtitle_path):
-            try:
-                os.remove(shifted_subtitle_path)
-            except OSError:
-                pass
 
 
 def main():
