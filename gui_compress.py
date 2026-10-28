@@ -18,7 +18,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from compress_video import (
     _gui_pause,
@@ -115,24 +115,26 @@ def _inject_ffmpeg_path(ffmpeg_dir: str):
 
 DEFAULT_MIN_SIZE_GB = 0.0
 DEFAULT_BITRATE     = "700k"
-DEFAULT_ENCODER     = "av1_nvenc"
+DEFAULT_ENCODER     = "libsvtav1"
 DEFAULT_SUB_OFFSET  = "0.0"
 DEFAULT_PREVIEW_START = "0.0"
 DEFAULT_PREVIEW_DURATION = "30.0"
 COL_CHECK   = "Select"
 COL_NAME    = "File Name"
 COL_SUB     = "Subtitle"
+COL_SUB_OFF = "Sub Offset"
 COL_ORIG    = "Original Size"
 COL_BITRATE = "Current Bitrate"
 COL_EST     = "Est. Output"
 COL_SAVE    = "Savings"
 COL_PCT     = "Save %"
-COLUMNS     = (COL_CHECK, COL_NAME, COL_SUB, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
+COLUMNS     = (COL_CHECK, COL_NAME, COL_SUB, COL_SUB_OFF, COL_ORIG, COL_BITRATE, COL_EST, COL_SAVE, COL_PCT)
 
 # Pre-computed column indices for fast access in hot loops
 _IDX_CHECK   = COLUMNS.index(COL_CHECK)
 _IDX_NAME    = COLUMNS.index(COL_NAME)
 _IDX_SUB     = COLUMNS.index(COL_SUB)
+_IDX_SUB_OFF = COLUMNS.index(COL_SUB_OFF)
 _IDX_ORIG    = COLUMNS.index(COL_ORIG)
 _IDX_BITRATE = COLUMNS.index(COL_BITRATE)
 _IDX_EST     = COLUMNS.index(COL_EST)
@@ -246,7 +248,7 @@ class CompressApp(tk.Tk):
         self._encoder_var = tk.StringVar(value=DEFAULT_ENCODER)
         encoder_combo = ttk.Combobox(
             top, textvariable=self._encoder_var, width=14,
-            values=["av1_nvenc", "hevc_nvenc", "h264_nvenc", "libsvtav1", "libaom-av1", "libx265", "libx264"],
+            values=["libsvtav1", "libaom-av1", "libx265", "libx264", "av1_nvenc", "hevc_nvenc", "h264_nvenc"],
         )
         encoder_combo.pack(side="left", padx=4)
 
@@ -315,6 +317,7 @@ class CompressApp(tk.Tk):
             COL_CHECK:   55,
             COL_NAME:    320,
             COL_SUB:     220,
+            COL_SUB_OFF: 90,
             COL_ORIG:    110,
             COL_BITRATE: 120,
             COL_EST:     110,
@@ -351,6 +354,12 @@ class CompressApp(tk.Tk):
         )
         self._pause_btn.pack(side="right", padx=2)
         self._pause_btn.state(["disabled"])
+
+        self._stop_btn = ttk.Button(
+            bot, text="⏹ Stop", command=self._stop_compress
+        )
+        self._stop_btn.pack(side="right", padx=2)
+        self._stop_btn.state(["disabled"])
 
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(bot, textvariable=self._status_var, anchor="w").pack(
@@ -580,7 +589,10 @@ class CompressApp(tk.Tk):
         if row_id not in self._tree.get_children():
             return
         vals = list(self._tree.item(row_id, "values"))
-        vals[_IDX_SUB] = self._subtitle_display_for_video(self._videos[idx])
+        v = self._videos[idx]
+        vals[_IDX_SUB] = self._subtitle_display_for_video(v)
+        offset_str = f"{v.get('_subtitle_offset', 0.0):+.3f}s" if (v.get("_subtitle_path") or "").strip() else ""
+        vals[_IDX_SUB_OFF] = offset_str
         self._tree.item(row_id, values=vals)
 
     def _assign_subtitle_to_selected(self):
@@ -599,10 +611,26 @@ class CompressApp(tk.Tk):
         if not path:
             return
 
+        # Show dialog to get per-file offset
+        offset_str = simpledialog.askstring(
+            "Subtitle Offset",
+            "Enter subtitle offset in seconds (e.g., 0.5 or -1.2):",
+            initialvalue="0"
+        )
+        if offset_str is None:  # user cancelled
+            return
+
+        try:
+            offset = float(offset_str)
+        except ValueError:
+            messagebox.showerror("Error", "Offset must be a valid number (in seconds).")
+            return
+
         for idx in selected_idx:
             self._videos[idx]["_subtitle_path"] = path
+            self._videos[idx]["_subtitle_offset"] = offset
             self._update_row_subtitle_display(idx)
-        self._set_status(f"Assigned subtitle to {len(selected_idx)} selected file(s): {os.path.basename(path)}")
+        self._set_status(f"Assigned subtitle with offset {offset:+.3f}s to {len(selected_idx)} selected file(s): {os.path.basename(path)}")
 
     def _clear_subtitle_for_selected(self):
         if not self._videos:
@@ -614,6 +642,7 @@ class CompressApp(tk.Tk):
 
         for idx in selected_idx:
             self._videos[idx]["_subtitle_path"] = ""
+            self._videos[idx]["_subtitle_offset"] = 0.0
             self._update_row_subtitle_display(idx)
         self._set_status(f"Cleared per-file subtitle on {len(selected_idx)} selected file(s).")
 
@@ -696,12 +725,14 @@ class CompressApp(tk.Tk):
             est       = v.get("_est_size", 0)
             orig_kbps = v.get("_probe", {}).get("video_bitrate_kbps")
             v.setdefault("_subtitle_path", "")
+            v.setdefault("_subtitle_offset", 0.0)
             bitrate_str = f"{orig_kbps} kbps" if orig_kbps else "N/A"
             est_str, save_str, pct_str = _compute_row_strings(orig, est)
 
             var = tk.BooleanVar(value=True)
             self._check_vars.append(var)
 
+            offset_str = f"{v['_subtitle_offset']:+.3f}s" if v['_subtitle_path'] else ""
             self._tree.insert(
                 "", "end",
                 iid=str(idx),
@@ -709,6 +740,7 @@ class CompressApp(tk.Tk):
                     "☑",
                     os.path.basename(v["path"]),
                     self._subtitle_display_for_video(v),
+                    offset_str,
                     format_size(orig),
                     bitrate_str,
                     est_str,
@@ -896,6 +928,15 @@ class CompressApp(tk.Tk):
             _gui_resume.clear()
             _gui_pause.set()
 
+    def _stop_compress(self):
+        """Stop the running compression job."""
+        if self._job_running:
+            _gui_stop.set()
+            _gui_resume.set()  # unblock if paused
+            self._log("[STOPPING] Compression stop requested by user.")
+            self._stop_btn.state(["disabled"])
+
+
     # ── Application close / cleanup ────────────────────────────────────────────
 
     def _on_close(self):
@@ -948,16 +989,17 @@ class CompressApp(tk.Tk):
             if not var.get():
                 continue
             per_file_sub = (v.get("_subtitle_path") or "").strip() or subtitle_path
+            per_file_offset = v.get("_subtitle_offset", 0.0) if (v.get("_subtitle_path") or "").strip() else subtitle_offset_s
             if per_file_sub and not os.path.isfile(per_file_sub):
                 messagebox.showerror(
                     "Error",
                     f"Subtitle file does not exist for {os.path.basename(v['path'])}:\n{per_file_sub}",
                 )
                 return
-            selected_entries.append((v, per_file_sub))
+            selected_entries.append((v, per_file_sub, per_file_offset))
 
-        with_sub_count = sum(1 for _, sub in selected_entries if sub)
-        subtitle_note = f"Subtitles on {with_sub_count}/{len(selected_entries)} selected file(s) ({subtitle_offset_s:+.3f}s)"
+        with_sub_count = sum(1 for _, sub, _ in selected_entries if sub)
+        subtitle_note = f"Subtitles on {with_sub_count}/{len(selected_entries)} selected file(s)\n(per-file or default {subtitle_offset_s:+.3f}s)"
         if with_sub_count == len(selected_entries) and subtitle_path:
             subtitle_note += f"\nDefault: {os.path.basename(subtitle_path)}"
         if not messagebox.askyesno(
@@ -970,6 +1012,7 @@ class CompressApp(tk.Tk):
 
         self._compress_btn.state(["disabled"])
         self._pause_btn.state(["!disabled"])
+        self._stop_btn.state(["!disabled"])
         self._paused = False
         _gui_pause.clear()
         _gui_resume.clear()
@@ -977,21 +1020,20 @@ class CompressApp(tk.Tk):
         self._job_running = True
         threading.Thread(
             target=self._compress_worker,
-            args=(selected_entries, bitrate, encoder, root, subtitle_offset_s),
+            args=(selected_entries, bitrate, encoder, root),
             daemon=True,
         ).start()
 
     def _compress_worker(
         self,
-        selected_entries: list[tuple[dict, str | None]],
+        selected_entries: list[tuple[dict, str | None, float]],
         bitrate: str,
         encoder: str,
         root: str,
-        subtitle_offset_s: float,
     ):
         total   = len(selected_entries)
         records = []
-        for i, (v, subtitle_path) in enumerate(selected_entries, 1):
+        for i, (v, subtitle_path, subtitle_offset_s) in enumerate(selected_entries, 1):
             if _gui_stop.is_set():
                 self._log("\n[STOPPED] Compression aborted by user.")
                 break
@@ -1023,6 +1065,7 @@ class CompressApp(tk.Tk):
                    f"Done. {ok} succeeded, {skip} skipped, {fail} failed. Log: {log_path}")
         self.after(0, self._compress_btn.state, ["!disabled"])
         self.after(0, self._pause_btn.state, ["disabled"])
+        self.after(0, self._stop_btn.state, ["disabled"])
         self.after(0, self._pause_btn.configure, {"text": "⏸ Pause"})
         self._job_running = False
         self._paused = False

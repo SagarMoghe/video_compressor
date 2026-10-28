@@ -1,6 +1,6 @@
 """
 Recursively scan a directory for video files over 1 GB and compress them
-using AV1 (default: av1_nvenc) @ 700 kbps -> MP4.
+using AV1 (default: libsvtav1) @ 700 kbps -> MP4.
 
 Usage:
     python scan_and_compress.py <input_path> [--min-size <GB>] [--bitrate <bitrate>]
@@ -27,6 +27,7 @@ from typing import List, Optional
 from compress_video import (
     compress_video,
     check_pause_between_videos,
+    build_compressed_output_path,
     estimate_compressed_size,
     format_size,
     probe_video,
@@ -68,8 +69,6 @@ def _scandir_recursive(root: str, min_bytes: int):
                 yield from _scandir_recursive(entry.path, min_bytes)
             elif entry.is_file(follow_symlinks=False):
                 name_lower = entry.name.lower()
-                if name_lower.endswith("_compressed.mp4"):
-                    continue
                 ext = os.path.splitext(name_lower)[1]
                 if ext not in VIDEO_EXTENSIONS:
                     continue
@@ -78,6 +77,9 @@ def _scandir_recursive(root: str, min_bytes: int):
                 except OSError:
                     continue
                 if size >= min_bytes:
+                    name_lower = entry.name.lower()
+                    if "_compressed" in name_lower and name_lower.endswith(".mp4"):
+                        continue
                     yield entry.path, size
 
 
@@ -127,8 +129,7 @@ def _process_one(
     """
     path = video["path"]
     original_size = video["size"]
-    base, _ = os.path.splitext(path)
-    output_path = f"{base}_compressed.mp4"
+    output_path = build_compressed_output_path(path)
 
     print(f"\n{'─'*60}")
     print(f"[{index}/{total}] Compressing: {path}")
@@ -202,7 +203,7 @@ def write_log(log_path: str, records: List[dict]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan for large videos and compress them with AV1 (default: av1_nvenc)."
+        description="Scan for large videos and compress them with AV1 (default: libsvtav1)."
     )
     parser.add_argument("input_path", help="Root directory to scan recursively.")
     parser.add_argument(
@@ -214,8 +215,8 @@ def main():
         help="Target video bitrate (default: 700k)."
     )
     parser.add_argument(
-        "--encoder", default="av1_nvenc",
-        help="FFmpeg video encoder (default: av1_nvenc).",
+        "--encoder", default="libsvtav1",
+        help="FFmpeg video encoder (default: libsvtav1).",
     )
     parser.add_argument(
         "--subtitle", default=None,
@@ -470,5 +471,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

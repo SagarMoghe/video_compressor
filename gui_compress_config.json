@@ -1,0 +1,15 @@
+{
+  "recent_folders": [
+    "D:\\New folder",
+    "H:\\",
+    "D:\\Backup"
+  ],
+  "bitrate": "700k",
+  "min_size_gb": 0.0,
+  "ffmpeg_dir": "C:/Users/sagar/Downloads/Compressed/ffmpeg-master-latest-win64-gpl-shared/ffmpeg-master-latest-win64-gpl-shared/bin",
+  "encoder": "av1_nvenc",
+  "subtitle_file": "",
+  "subtitle_offset_s": 0.0,
+  "preview_start_s": 0.0,
+  "preview_duration_s": 0.0
+}

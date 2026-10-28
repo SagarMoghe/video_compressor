@@ -1,5 +1,5 @@
 """
-Compress a single video file using AV1 (default: NVIDIA NVENC av1_nvenc).
+Compress a single video file using AV1 (default: libsvtav1).
 Target bitrate = min(original_bitrate, requested_bitrate).
 Output format: MP4.  Press P during encoding to pause / resume.
 
@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import collections
+import hashlib
 import ctypes
 import json
 import os
@@ -178,12 +179,52 @@ def probe_video(input_path: str) -> dict:
     return result_dict
 
 
-def _check_gpu_available(encoder: str) -> bool:
-    """Check if a GPU encoder is available via ffmpeg -encoders."""
-    if "nvenc" not in encoder.lower() and "cuda" not in encoder.lower():
-        return True  # Not GPU-specific, assume available
+def build_compressed_output_path(input_path: str) -> str:
+    """Build a shorter MP4 output path for very long source filenames."""
+    abs_input = os.path.abspath(input_path)
+    directory = os.path.dirname(abs_input)
+    stem, _ = os.path.splitext(os.path.basename(abs_input))
+    if not stem:
+        stem = "output"
+
+    def _candidate(stem_value: str, digest_value: str | None = None) -> str:
+        if digest_value:
+            name = f"{stem_value}_compressed_{digest_value}.mp4"
+        else:
+            name = f"{stem_value}_compressed.mp4"
+        return os.path.join(directory, name)
+
+    candidate = _candidate(stem)
+    if len(candidate) <= 220:
+        return candidate
+
+    digest = hashlib.sha1(abs_input.encode("utf-8")).hexdigest()[:10]
+    budget = max(24, 220 - len(directory) - len(os.sep) - len("_compressed_") - len(digest) - 4)
+    shortened = stem[:budget].rstrip(" ._")
+    if not shortened:
+        shortened = "output"
+    candidate = _candidate(shortened, digest)
+    return candidate
+
+
+def _is_valid_output_media(output_path: str) -> bool:
+    """Return True when FFmpeg produced a readable, non-empty media file."""
+    if not os.path.isfile(output_path):
+        return False
     try:
-        cmd = ["ffmpeg", "-codecs"]
+        if os.path.getsize(output_path) <= 0:
+            return False
+    except OSError:
+        return False
+
+    probe = probe_video(output_path)
+    return probe.get("duration") is not None and probe.get("duration", 0) > 0
+
+
+def _check_gpu_available(encoder: str) -> bool:
+    """Check whether FFmpeg exposes the requested encoder."""
+    try:
+        cmd = ["ffmpeg", "-hide_banner", "-encoders"]
         kwargs = {}
         if _IS_WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -191,6 +232,22 @@ def _check_gpu_available(encoder: str) -> bool:
         return encoder.lower() in proc.stdout.lower()
     except Exception:
         return False
+
+
+def _is_fatal_encoder_failure(encoder: str, stderr_text: str) -> bool:
+    """Return True when an encoder error should skip the rest of the bitrate retries."""
+    if "nvenc" not in encoder.lower() and "cuda" not in encoder.lower():
+        return False
+
+    err = (stderr_text or "").lower()
+    fatal_markers = (
+        "invalid argument",
+        "no capable devices found",
+        "cannot load libnvidia-encode",
+        "failed to initialize encoder",
+        "encoder not initialized",
+    )
+    return any(marker in err for marker in fatal_markers)
 
 
 def _get_fallback_encoders(primary_encoder: str) -> list:
@@ -227,7 +284,7 @@ _CONTAINER_OVERHEAD = 1.02
 # Audio bitrate used for encoding (kbps)
 _AUDIO_BITRATE_KBPS = 128
 _AUDIO_CODEC = "aac"
-_DEFAULT_ENCODER = "av1_nvenc"
+_DEFAULT_ENCODER = "libsvtav1"
 
 
 def estimate_compressed_size(
@@ -367,6 +424,14 @@ def _toggle_ffmpeg_pause(proc: subprocess.Popen) -> bool:
     return False
 
 
+def _cleanup_output_path(output_path: str):
+    if os.path.isfile(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+
 def _remux_to_mp4_copy(input_path: str, output_path: str) -> bool:
     """Fast path: remux input to MP4 with stream copy (no re-encode)."""
     cmd = [
@@ -394,7 +459,7 @@ def _remux_to_mp4_copy(input_path: str, output_path: str) -> bool:
             errors="replace",
             **kwargs,
         )
-        if proc.returncode == 0 and os.path.isfile(output_path):
+        if proc.returncode == 0 and _is_valid_output_media(output_path):
             return True
         if os.path.isfile(output_path):
             os.remove(output_path)
@@ -415,8 +480,8 @@ def _attempt_encode(
     effective_kbps: int,
     duration: float,
     subtitle_filter: str,
-) -> bool:
-    """Attempt a single encode with the given parameters. Returns True on success."""
+) -> tuple[bool, bool]:
+    """Attempt a single encode. Returns (success, fatal_encoder_failure)."""
     cmd = [
         "ffmpeg",
         "-y", "-probesize", "50M", "-analyzeduration", "100M",
@@ -472,14 +537,19 @@ def _attempt_encode(
         last_progress_s = 0.0
         encode_start = time.time()
 
+        if _gui_stop.is_set():
+            proc.terminate()
+            proc.wait(timeout=5)
+            _cleanup_output_path(output_path)
+            return False, False
+
         if duration and duration > 0:
             for line in proc.stdout:
                 if _gui_stop.is_set():
                     proc.terminate()
                     proc.wait(timeout=5)
-                    if os.path.isfile(output_path):
-                        os.remove(output_path)
-                    return False
+                    _cleanup_output_path(output_path)
+                    return False, False
 
                 if _pause_key_pressed():
                     if not paused:
@@ -515,9 +585,8 @@ def _attempt_encode(
                 if _gui_stop.is_set():
                     proc.terminate()
                     proc.wait(timeout=5)
-                    if os.path.isfile(output_path):
-                        os.remove(output_path)
-                    return False
+                    _cleanup_output_path(output_path)
+                    return False, False
                 if _pause_key_pressed() and not paused:
                     if not _toggle_ffmpeg_pause(proc):
                         _suspend_process(proc.pid)
@@ -536,19 +605,14 @@ def _attempt_encode(
         if proc.returncode != 0:
             err_text = "".join(stderr_lines)
             print(f"[WARN] Encoder '{encoder}' failed: {err_text[-500:]}")
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-            return False
+            _cleanup_output_path(output_path)
+            return False, _is_fatal_encoder_failure(encoder, err_text)
 
-        return os.path.isfile(output_path)
+        return _is_valid_output_media(output_path), False
     except Exception as exc:
         print(f"[WARN] Exception during encode with '{encoder}': {exc}")
-        if os.path.isfile(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-        return False
+        _cleanup_output_path(output_path)
+        return False, False
 
 
 # ── Main compression function ───────────────────────────────────
@@ -569,7 +633,7 @@ def compress_video(
         input_path:  Absolute path to the source video.
         output_path: Absolute path for the compressed output (.mp4).
         bitrate:     Target video bitrate (default "700k").
-        encoder:     FFmpeg video encoder (default "av1_nvenc").
+        encoder:     FFmpeg video encoder (default "libsvtav1").
         subtitle_path: Optional path to an .srt subtitle file to burn in.
         subtitle_offset_s: Subtitle offset in seconds (positive delays subtitles).
 
@@ -652,28 +716,36 @@ def compress_video(
     if _IS_WINDOWS:
         print(f"           Press P to pause / resume")
 
-    encoders_to_try = [encoder] + _get_fallback_encoders(encoder)
-    bitrates_to_try = [effective_kbps]
+    encoders_to_try = []
+    for candidate in [encoder] + _get_fallback_encoders(encoder):
+        if candidate in encoders_to_try:
+            continue
+        if _check_gpu_available(candidate):
+            encoders_to_try.append(candidate)
+        else:
+            print(f"[WARN] Encoder '{candidate}' is not available in this FFmpeg build; skipping.")
 
-    # Generate fallback bitrates (reduce by 20% each time, min 200 kbps)
+    if not encoders_to_try:
+        print("[ERROR] No usable encoders are available.")
+        return False
+
+    bitrates_to_try = [effective_kbps]
     current_br = effective_kbps
     while current_br > 200:
         current_br = int(current_br * 0.8)
         bitrates_to_try.append(current_br)
 
     try:
+        total_attempts = len(encoders_to_try) * len(bitrates_to_try)
         for enc_idx, try_encoder in enumerate(encoders_to_try):
             for br_idx, try_kbps in enumerate(bitrates_to_try):
                 try_bitrate = f"{try_kbps}k"
-
                 attempt_num = enc_idx * len(bitrates_to_try) + br_idx + 1
-                total_attempts = len(encoders_to_try) * len(bitrates_to_try)
-
                 if attempt_num > 1:
                     print(f"\n[RETRY {attempt_num}/{total_attempts}] "
                           f"Encoder: {try_encoder}  |  Bitrate: {try_bitrate}")
 
-                success = _attempt_encode(
+                success, fatal_encoder_failure = _attempt_encode(
                     input_path,
                     output_path,
                     try_encoder,
@@ -683,9 +755,20 @@ def compress_video(
                     subtitle_filter,
                 )
 
+                if fatal_encoder_failure:
+                    print(
+                        f"[WARN] Encoder '{try_encoder}' reported a non-retryable "
+                        "compatibility failure. Trying the next encoder."
+                    )
+                    break
+
                 if success:
                     print(f"[OK] Encoding succeeded with {try_encoder} @ {try_bitrate}")
-                    # Continue to size check
+                    if not _is_valid_output_media(output_path):
+                        print(f"[ERROR] Output file failed validation: {output_path}")
+                        _cleanup_output_path(output_path)
+                        return False
+
                     compressed_size = (
                         os.path.getsize(output_path) if os.path.isfile(output_path) else 0
                     )
@@ -696,28 +779,26 @@ def compress_video(
                                 f"is not smaller than the original "
                                 f"({format_size(original_size)}). Discarding output."
                             )
-                            os.remove(output_path)
+                            _cleanup_output_path(output_path)
                             return None
+                        if has_subtitles:
+                            print(
+                                f"[KEEP] Compressed file ({format_size(compressed_size)}) "
+                                f"is not smaller than the original "
+                                f"({format_size(original_size)}), but keeping output "
+                                f"because subtitles were burned in."
+                            )
                         else:
-                            if has_subtitles:
-                                print(
-                                    f"[KEEP] Compressed file ({format_size(compressed_size)}) "
-                                    f"is not smaller than the original "
-                                    f"({format_size(original_size)}), but keeping output "
-                                    f"because subtitles were burned in."
-                                )
-                            else:
-                                print(
-                                    f"[KEEP] Compressed file ({format_size(compressed_size)}) "
-                                    f"is not smaller than the original "
-                                    f"({format_size(original_size)}), but keeping MP4 "
-                                    f"(original was not MP4)."
-                                )
+                            print(
+                                f"[KEEP] Compressed file ({format_size(compressed_size)}) "
+                                f"is not smaller than the original "
+                                f"({format_size(original_size)}), but keeping MP4 "
+                                f"(original was not MP4)."
+                            )
 
                     print(f"[OK] Compressed successfully -> {output_path}")
                     return True
 
-        # ── All attempts failed ──────────────────────────────────────
         print(f"\n[ERROR] All {total_attempts} encode attempts failed. "
               f"({len(encoders_to_try)} encoders × {len(bitrates_to_try)} bitrates)")
         return False
@@ -819,7 +900,7 @@ def create_subtitle_preview(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compress a video to AV1 (default av1_nvenc) and output MP4."
+        description="Compress a video to AV1 (default libsvtav1) and output MP4."
     )
     parser.add_argument("input", help="Path to the input video file.")
     parser.add_argument(
@@ -852,8 +933,7 @@ def main():
     if args.output:
         output_path = os.path.abspath(args.output)
     else:
-        base, _ = os.path.splitext(input_path)
-        output_path = f"{base}_compressed.mp4"
+        output_path = build_compressed_output_path(input_path)
 
     result = compress_video(
         input_path,
